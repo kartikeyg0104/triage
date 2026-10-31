@@ -15,3 +15,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./
+        id: claimcheck
+      - name: Use the claimcheck outputs
+        if: always()
+        env:
+          VERDICT: ${{ steps.claimcheck.outputs.verdict }}
+          CONFIRMED: ${{ steps.claimcheck.outputs.confirmed }}
+          REFUTED: ${{ steps.claimcheck.outputs.refuted }}
+          UNVERIFIED: ${{ steps.claimcheck.outputs.unverified }}
+          REPORT_JSON: ${{ steps.claimcheck.outputs.report-json }}
+        run: |
+          {
+            echo "## claimcheck step outputs"
+            echo ""
+            echo "verdict: \`${VERDICT:-none}\` (confirmed ${CONFIRMED:-0}, refuted ${REFUTED:-0}, unverified ${UNVERIFIED:-0})"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$REPORT_JSON" ] && [ -f "$REPORT_JSON" ]; then
+            python3 -c 'import json, sys; print("report-json verdict:", json.load(open(sys.argv[1]))["verdict"])' "$REPORT_JSON"
+          fi
