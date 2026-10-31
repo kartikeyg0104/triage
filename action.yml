@@ -10,6 +10,9 @@ inputs:
   expect:
     description: Text the failing repro command should print.
     default: ""
+  verify-fix:
+    description: Run the workflow repro on the PR base and head SHAs from the event to verify a fix. Both commits must be fetched; use actions/checkout with fetch-depth 0. Missing commits leave the fix unverified.
+    default: "false"
   comment:
     description: Post the report as a PR/issue comment.
     default: "true"
@@ -54,6 +57,7 @@ runs:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_REPRO: ${{ inputs.repro }}
         INPUT_EXPECT: ${{ inputs.expect }}
+        INPUT_VERIFY_FIX: ${{ inputs.verify-fix }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_FAIL_ON_REFUTED: ${{ inputs.fail-on-refuted }}
         INPUT_CHECK_RUN: ${{ inputs.check-run }}
