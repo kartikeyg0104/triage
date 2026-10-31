@@ -75,3 +75,19 @@ Options: `--once` (exit when the queue is empty, e.g. from cron), `--poll` (seco
 - Rows are polled, not pushed: a new event waits up to `--poll` seconds.
 - No GitHub App authentication (installation tokens, JWT) yet, and no posting of results back to GitHub.
 - Checks run inside the request, so a very large repo makes `POST /v1/investigations` slow.
+
+## Dashboard
+
+The server also renders a small read-only HTML dashboard from the same SQLite file (no JavaScript, no build step, nothing loaded from another host):
+
+| Path | Shows |
+|---|---|
+| `GET /` or `GET /dashboard` | Investigations newest first: id, source, status, verdict, created time (UTC). `?status=received` (or `processing`, `completed`, `skipped`, `failed`) filters; 50 per page, `?page=2` for older ones. A bad `page` is a `400` page. |
+| `GET /dashboard/investigations/{id}` | One investigation: source, status, created time, delivery id, worker and error; the verdict, extraction model and revision; each claim's status, kind, basis, evidence detail and source; and the stored request (report and diff, or the webhook event, its text and claims). An unknown id is a `404` page. |
+
+Open `http://127.0.0.1:8080/` in a browser. The JSON API is unchanged.
+
+- **Escaping.** Report text, webhook titles and bodies, and every value derived from them are untrusted. Every value is escaped with `html.escape` before it is written to the page, so `<script>alert(1)</script>` or `"><img onerror=...>` shows up as text. Status values only become CSS classes if they are one of the known statuses.
+- **Headers.** Every dashboard response, including the `400` and `404` pages, sends `Content-Security-Policy: default-src 'none'; style-src 'sha256-...'; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` (no script runs at all, and only the page's one inline style block is allowed, by its hash), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and `Cache-Control: no-store`.
+- **Read-only.** Only `GET` routes and no forms; anything else is `405`.
+- **No authentication**, like the API: it shows report and event text to anyone who can reach the port. Keep it on localhost or behind an authenticating proxy.

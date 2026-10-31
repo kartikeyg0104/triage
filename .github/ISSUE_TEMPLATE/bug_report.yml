@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a bug that claimcheck can test. Give the function, a command that reproduces it and the error you see.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in each field so the claim can be checked against the code. Field values are treated as text and never run as-is.
+  - type: input
+    id: symbol
+    attributes:
+      label: Affected function or class
+      description: The name as written in the code, e.g. `parse_header` or `Session.close`.
+      placeholder: parse_header
+    validations:
+      required: true
+  - type: textarea
+    id: repro_command
+    attributes:
+      label: Repro command
+      description: One shell command that shows the bug from a clean checkout.
+      placeholder: python -c "from pkg import parse_header; parse_header('x')"
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected_error
+    attributes:
+      label: Expected error text
+      description: The error or output the command produces, e.g. the last line of the traceback.
+      placeholder: "ValueError: bad header"
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The release or git commit you tested.
+      placeholder: v1.2.3 or abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happens, and what you expected to happen instead.
+    validations:
+      required: true

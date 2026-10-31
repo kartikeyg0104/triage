@@ -1,0 +1,15 @@
+{
+  "truth": "repo/src/shapes.ts declares interface ShapeOptions (line 3), enum Kind (line 8), abstract class Shape with abstract method area (line 16) and method describe whose return type sits between the parameters and the body (line 18), and class Circle (line 23) with area implemented (line 30) and scaleBy as an arrow-function class field (line 34). Running it with node --experimental-transform-types shows Circle, Kind, describe, area and scaleBy at runtime; ShapeOptions is a type, which exists in the source though not at runtime. perimeter appears nowhere, so the report is refuted.",
+  "expected": {
+    "claims": {
+      "symbol:describe": "confirmed",
+      "symbol:Circle": "confirmed",
+      "symbol:ShapeOptions": "confirmed",
+      "symbol:scaleBy": "confirmed",
+      "symbol:area": "confirmed",
+      "symbol:Kind": "confirmed",
+      "symbol:perimeter": "refuted"
+    },
+    "overall": "refuted"
+  }
+}

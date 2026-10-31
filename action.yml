@@ -16,6 +16,9 @@ inputs:
   fail-on-refuted:
     description: Fail the check when a claim is refuted.
     default: "false"
+  check-run:
+    description: Create a "claimcheck" Check Run on the PR head commit, with annotations. Needs the "checks write" permission; without it a warning is logged and the job continues.
+    default: "true"
   github-token:
     description: Token used to read the diff and post the comment.
     default: ${{ github.token }}
@@ -53,5 +56,6 @@ runs:
         INPUT_EXPECT: ${{ inputs.expect }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_FAIL_ON_REFUTED: ${{ inputs.fail-on-refuted }}
+        INPUT_CHECK_RUN: ${{ inputs.check-run }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: python -m claimcheck.action
