@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--k8s-image", default="python:3.12-slim")
     check.add_argument("--k8s-runtime-class", help="e.g. gvisor; only if the cluster has that RuntimeClass")
     check.add_argument("--kube-context", help="kubectl context to use")
+    check.add_argument("--k8s-impersonate", metavar="USER",
+                       help="run every kubectl call as USER (kubectl --as), e.g. "
+                            "system:serviceaccount:claimcheck:claimcheck-executor from deploy/k8s")
     return parser
 
 
@@ -69,7 +72,8 @@ def main(argv: list[str] | None = None) -> int:
     run_repro = sandbox.run_repro
     if args.executor == "kubernetes":
         run_repro = k8s.KubernetesExecutor(namespace=args.k8s_namespace, image=args.k8s_image,
-                                           runtime_class=args.k8s_runtime_class, context=args.kube_context).run_repro
+                                           runtime_class=args.k8s_runtime_class, context=args.kube_context,
+                                           impersonate=args.k8s_impersonate).run_repro
     verdict, model = run_check(args.repo, args.report.read_text(), diff, args.repro, args.expect, not args.no_model,
                                run_repro, base=args.base, head=args.head)
     print((report.to_json if args.json else report.to_markdown)(verdict, model), end="")
