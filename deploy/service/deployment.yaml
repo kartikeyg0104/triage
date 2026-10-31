@@ -1,0 +1,150 @@
+# The API and the webhook worker, as two containers of one pod sharing the SQLite file on the
+# ReadWriteOnce PVC. One replica, and Recreate so a rollout never runs an old and a new pod at
+# once (two pods could land on different nodes, and only one node can mount the volume).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claimcheck-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: server
+    spec:
+      automountServiceAccountToken: false  # neither process talks to the Kubernetes API
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001  # makes the PVC writable by UID 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/kartikeyg0104/claimcheck
+          # The image's ENTRYPOINT is the `claimcheck` CLI; the service is a Python module.
+          command: ["python"]
+          args: ["-m", "claimcheck.server", "--db", "/data/claimcheck.db", "--repo-root", "/repos",
+                 "--host", "0.0.0.0"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: CLAIMCHECK_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claimcheck-secrets
+                  key: CLAIMCHECK_API_TOKEN
+            - name: CLAIMCHECK_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: claimcheck-secrets
+                  key: CLAIMCHECK_WEBHOOK_SECRET
+          # No unauthenticated health path exists, so the probes check that the port accepts.
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: repos
+              mountPath: /repos
+              readOnly: true
+        - name: worker
+          image: ghcr.io/kartikeyg0104/claimcheck
+          command: ["python"]
+          args: ["-m", "claimcheck.server.worker", "--db", "/data/claimcheck.db", "--repo-root", "/repos",
+                 "--repos", "/etc/claimcheck/repos.json"]
+          # The worker serves nothing, so its probes open the database it polls.
+          readinessProbe:
+            exec:
+              command: ["python", "-c",
+                        "import sqlite3; sqlite3.connect('/data/claimcheck.db', timeout=5).execute('select 1 from investigations limit 1')"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["python", "-c",
+                        "import sqlite3; sqlite3.connect('/data/claimcheck.db', timeout=5).execute('select 1 from investigations limit 1')"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: repos
+              mountPath: /repos
+              readOnly: true
+            - name: repo-map
+              mountPath: /etc/claimcheck
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: claimcheck-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        # Placeholder: replace with a volume holding the checkouts the API and the worker may
+        # read (see README.md). Mounted read-only in both containers.
+        - name: repos
+          emptyDir:
+            sizeLimit: 1Mi
+        - name: repo-map
+          configMap:
+            name: claimcheck-repos
