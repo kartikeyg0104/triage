@@ -41,13 +41,33 @@ def find_symbol(repo: Path, name: str) -> list[tuple[Path, int]]:
     return hits
 
 
+def _mentions(repo: Path, name: str) -> tuple[Path, int] | None:
+    """First place the name appears at all, even if it is not a definition."""
+    word = re.compile(rf"\b{re.escape(name)}\b")
+    for path in _source_files(repo):
+        for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if word.search(line):
+                return path, number
+    return None
+
+
 def check_symbol(repo: Path, name: str) -> Evidence:
+    """A static search can show a definition exists. It can only suggest one does not:
+    code may define names dynamically (setattr, globals(), __getattr__, re-exports)."""
     claim = Claim("symbol", f"{name}() exists", name)
     hits = find_symbol(repo, name)
     if hits:
         path, line = hits[0]
-        return Evidence(claim, Status.CONFIRMED, f"{name} is defined", f"{path.relative_to(repo)}:{line}")
-    return Evidence(claim, Status.REFUTED, f"{name} is not defined anywhere in the repo", repo.resolve().name)
+        return Evidence(claim, Status.CONFIRMED, f"{name} is defined", f"{path.relative_to(repo)}:{line}", "observed")
+    where = _mentions(repo, name)
+    if where:
+        path, line = where
+        return Evidence(claim, Status.UNVERIFIED,
+                        f"{name} is referenced but no static definition was found; it may be defined dynamically",
+                        f"{path.relative_to(repo)}:{line}", "inferred")
+    count = sum(1 for _ in _source_files(repo))
+    return Evidence(claim, Status.REFUTED, f"{name} does not appear in any of {count} source files (static search)",
+                    repo.resolve().name, "inferred")
 
 
 def changed_files(diff: str) -> list[str]:
@@ -68,13 +88,16 @@ def _is_test(path: str) -> bool:
 
 
 def check_pr_tests(diff: str) -> Evidence:
-    """A PR that changes source but touches no test file is flagged."""
-    claim = Claim("pr_tests", "the PR adds tests for its change")
+    """Whether the diff touches test files. Not touching them does not show the change is
+    untested: existing tests may already cover it."""
+    claim = Claim("pr_tests", "the PR changes tests alongside its source change")
     files = changed_files(diff)
     code = [f for f in files if Path(f).suffix in SOURCE_SUFFIXES and not _is_test(f)]
     tests = [f for f in files if _is_test(f)]
     if not code:
-        return Evidence(claim, Status.UNVERIFIED, "the diff changes no source files", "diff")
+        return Evidence(claim, Status.UNVERIFIED, "the diff changes no source files", "diff", "observed")
     if tests:
-        return Evidence(claim, Status.CONFIRMED, f"{len(tests)} test file(s) changed: {', '.join(tests)}", "diff")
-    return Evidence(claim, Status.REFUTED, f"no test covers the change to {', '.join(code)}", "diff")
+        return Evidence(claim, Status.CONFIRMED, f"{len(tests)} test file(s) changed: {', '.join(tests)}", "diff", "observed")
+    return Evidence(claim, Status.UNVERIFIED,
+                    f"no test file changed with {', '.join(code)}; existing tests may still cover it (coverage was not measured)",
+                    "diff", "inferred")

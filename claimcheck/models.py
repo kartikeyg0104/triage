@@ -25,11 +25,13 @@ class Evidence:
     status: Status
     detail: str
     source: str = ""  # file:line or command that produced the evidence
+    basis: str = "observed"  # "observed": we saw it happen; "inferred": we concluded it from absence or from a heuristic
 
 
 @dataclass
 class Verdict:
     evidence: list[Evidence] = field(default_factory=list)
+    revision: str = ""  # git commit of the repo that was tested, if it is a git checkout
 
     @property
     def outcome(self) -> str:
