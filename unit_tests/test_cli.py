@@ -78,3 +78,28 @@ def test_revision_of_a_git_checkout_is_reported(tmp_path, capsys):
     rep = write(tmp_path, "r.txt", "x `parse_url()`")
     cli.main(["check", "--repo", str(tmp_path), "--report", rep, "--no-model", "--json"])
     assert json.loads(capsys.readouterr().out)["revision"] == sha
+
+
+def test_kubernetes_executor_is_used_with_its_settings(repo, tmp_path, monkeypatch, capsys):
+    from claimcheck import k8s
+    from claimcheck.models import Claim, Evidence, Status
+
+    seen = {}
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            seen["init"] = kwargs
+
+        def run_repro(self, repo_path, command, expect, timeout=30):
+            seen["run"] = (command, expect)
+            return Evidence(Claim("repro", command), Status.CONFIRMED, "reproduced in pod", "kubernetes[ns/gvisor]: x")
+
+    monkeypatch.setattr(k8s, "KubernetesExecutor", FakeExecutor)
+    rep = write(tmp_path, "r.txt", "crash in `parse_url()`")
+    code = cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model", "--repro", "python3 poc.py",
+                     "--expect", "boom", "--executor", "kubernetes", "--k8s-namespace", "ns",
+                     "--k8s-runtime-class", "gvisor", "--kube-context", "kind-x"])
+    assert code == 0
+    assert seen["init"] == {"namespace": "ns", "image": "python:3.12-slim", "runtime_class": "gvisor", "context": "kind-x"}
+    assert seen["run"] == ("python3 poc.py", "boom")
+    assert "kubernetes[ns/gvisor]" in capsys.readouterr().out
