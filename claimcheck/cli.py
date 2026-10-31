@@ -26,7 +26,7 @@ def run_check(repo: Path, report_text: str, diff: str | None, repro: str | None,
         extraction = extract.extract_claims(report_text, model=model_name)
     else:
         extraction = extract.extract_claims(report_text)
-    verdict = Verdict(revision=git_revision(repo))
+    verdict = Verdict(revision=git_revision(repo), report_truncated=extraction.truncated)
     for claim in extraction.claims:
         verdict.evidence.append(checks.check_symbol(repo, claim.target))
     if extraction.note:
