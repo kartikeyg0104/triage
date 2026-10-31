@@ -32,7 +32,8 @@ def test_ignores_vendored_dirs(tmp_path):
 def test_missing_symbol_is_refuted(tmp_path):
     evidence = check_symbol(make_repo(tmp_path), "parse_url_v2")
     assert evidence.status is Status.REFUTED
-    assert "not defined" in evidence.detail
+    assert "does not appear" in evidence.detail
+    assert evidence.basis == "inferred"
 
 
 def test_existing_symbol_is_confirmed_with_location(tmp_path):
@@ -49,9 +50,11 @@ def test_changed_files_parses_diff():
     assert changed_files(DIFF_WITH_TEST) == ["cli.py", "tests/test_cli.py"]
 
 
-def test_pr_without_tests_is_refuted():
+def test_pr_without_test_changes_is_unverified_not_refuted():
     evidence = check_pr_tests(DIFF_NO_TEST)
-    assert evidence.status is Status.REFUTED
+    assert evidence.status is Status.UNVERIFIED
+    assert evidence.basis == "inferred"
+    assert "existing tests may still cover it" in evidence.detail
     assert "cli.py" in evidence.detail
 
 
@@ -61,3 +64,16 @@ def test_pr_with_tests_is_confirmed():
 
 def test_docs_only_pr_is_unverified():
     assert check_pr_tests("--- a/README.md\n+++ b/README.md\n").status is Status.UNVERIFIED
+
+
+def test_name_that_is_only_referenced_is_unverified(tmp_path):
+    (tmp_path / "plugins.py").write_text("import sys\nsetattr(sys.modules[__name__], 'dyn_handler', lambda: 1)\nNAMES = ['dyn_handler']\n")
+    evidence = check_symbol(tmp_path, "dyn_handler")
+    assert evidence.status is Status.UNVERIFIED
+    assert "dynamically" in evidence.detail
+    assert evidence.source == "plugins.py:2"
+
+
+def test_confirmed_symbol_is_observed(tmp_path):
+    (tmp_path / "a.py").write_text("def f():\n    pass\n")
+    assert check_symbol(tmp_path, "f").basis == "observed"
