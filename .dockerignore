@@ -1,0 +1,39 @@
+# Only pyproject.toml, README.md, LICENSE and claimcheck/ are copied; keep the build context small anyway.
+.git
+.github
+.claude
+.gitignore
+.dockerignore
+Dockerfile
+unit_tests
+eval
+examples
+deploy
+docs
+action.yml
+HACKATHON.md
+
+# Virtualenvs and caches
+.venv
+venv
+env
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+build
+dist
+
+# Local databases, documents and images
+**/*.db
+**/*.sqlite*
+**/*.pdf
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.webp
+**/*.svg
+.DS_Store
