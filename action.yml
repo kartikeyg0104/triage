@@ -1,0 +1,40 @@
+name: claimcheck
+description: Test the claims in a pull request or issue and post the evidence as a comment.
+inputs:
+  path:
+    description: Path of the checked-out repository to search.
+    default: "."
+  repro:
+    description: Command that reproduces the reported failure. Run in a no-network sandbox. Never taken from the PR text.
+    default: ""
+  expect:
+    description: Text the failing repro command should print.
+    default: ""
+  comment:
+    description: Post the report as a PR/issue comment.
+    default: "true"
+  fail-on-refuted:
+    description: Fail the check when a claim is refuted.
+    default: "false"
+  github-token:
+    description: Token used to read the diff and post the comment.
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install claimcheck
+      shell: bash
+      run: python -m pip install --quiet "${{ github.action_path }}"
+    - name: Check the claims
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_REPRO: ${{ inputs.repro }}
+        INPUT_EXPECT: ${{ inputs.expect }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_FAIL_ON_REFUTED: ${{ inputs.fail-on-refuted }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: python -m claimcheck.action
