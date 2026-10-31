@@ -11,6 +11,8 @@ resources:
   - serviceaccount.yaml
   - role.yaml
   - rolebinding.yaml
+  - quota.yaml
+  - limitrange.yaml
 labels:
   - pairs:
       app.kubernetes.io/name: claimcheck

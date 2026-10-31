@@ -1,0 +1,5 @@
+Bug report: slug collisions.
+
+slugify() lowercases the title, so two titles that differ only in punctuation
+get the same slug. The new deduplicateSlug() helper is supposed to fix this,
+but it is never called.

@@ -1,0 +1,27 @@
+# Caps what all runs in namespace claimcheck can use together, so many concurrent repro Jobs
+# cannot exhaust the cluster. Sized for 10 executor pods at once. A run has one pod at a time
+# (the network probe, then the repro), each requesting 100m CPU / 64Mi and limited to 500m / 256Mi
+# (claimcheck/k8s.py build_job), so:
+#   count/pods 10, count/jobs.batch 10   at most 10 runs in flight (count/pods also counts
+#                                        finished pods until their Job is deleted)
+#   configmaps 12                        one repo ConfigMap per run (up to ~1.2 MiB each) plus
+#                                        kube-root-ca.crt, which every namespace has, plus one spare
+#   requests.cpu 1, requests.memory 640Mi   10 x 100m, 10 x 64Mi
+#   limits.cpu 5, limits.memory 2560Mi      10 x 500m, 10 x 256Mi
+# When the quota is full, the Job is still created but the Job controller cannot create its pod
+# (FailedCreate ... exceeded quota); the executor then reports the run as not finished in time.
+# See docs/KUBERNETES_SECURITY.md.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: claimcheck-executor
+  namespace: claimcheck
+spec:
+  hard:
+    count/pods: "10"
+    count/jobs.batch: "10"
+    configmaps: "12"
+    requests.cpu: "1"
+    requests.memory: 640Mi
+    limits.cpu: "5"
+    limits.memory: 2560Mi

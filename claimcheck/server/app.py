@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import report
 from ..cli import run_check
-from . import webhook
+from . import dashboard, webhook
 from .paths import inside_root
 from .store import Store
 
@@ -100,4 +100,5 @@ def create_app(db_path: Path, repo_root: Path, webhook_secret: str, max_body: in
                                                          delivery_id=delivery)
         return {"id": investigation.id, "status": investigation.status, "duplicate": not created}
 
+    app.include_router(dashboard.router(store))
     return app
