@@ -6,15 +6,20 @@ checks as data. It is never put in a shell command, and a repro command found in
 
 import json
 import os
+import re
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
 from . import report
 from .cli import run_check
+from .models import Status
 
 MARKER = "<!-- claimcheck -->"
 API = "https://api.github.com"
+REPORT_NAME = "claimcheck-report.json"
+OUTPUT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 
 def event_text(event: dict) -> tuple[int, str, bool] | None:
@@ -49,6 +54,29 @@ def post_comment(repo: str, number: int, body: str, token: str, http=_request) -
     return "created"
 
 
+def write_report(json_text: str, env: dict) -> Path:
+    """Write the JSON report under $RUNNER_TEMP (or the system temp dir) and return its path."""
+    path = Path(env.get("RUNNER_TEMP") or tempfile.gettempdir()) / REPORT_NAME
+    path.write_text(json_text)
+    return path
+
+
+def write_outputs(outputs: dict, output_file: str | None) -> None:
+    """Append step outputs to $GITHUB_OUTPUT in the single-line name=value form.
+
+    Names must be fixed identifiers chosen by this code, never PR text. Values are flattened to one
+    line, so nothing in a value can start a new output line or a name<<DELIMITER block.
+    """
+    lines = []
+    for name, value in outputs.items():
+        if not OUTPUT_NAME.fullmatch(name):
+            raise ValueError(f"unsafe output name: {name!r}")
+        lines.append(f"{name}={' '.join(str(value).splitlines())}\n")
+    if output_file:
+        with open(output_file, "a") as out:
+            out.writelines(lines)
+
+
 def run(env: dict, http=_request) -> int:
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text())
     found = event_text(event)
@@ -63,6 +91,9 @@ def run(env: dict, http=_request) -> int:
         env.get("INPUT_EXPECT", ""), use_model=False,
     )
     markdown = report.to_markdown(verdict, model)
+    report_path = write_report(report.to_json(verdict, model), env)
+    counts = {status.value: sum(e.status == status for e in verdict.evidence) for status in Status}
+    write_outputs({"verdict": verdict.outcome, **counts, "report-json": str(report_path)}, env.get("GITHUB_OUTPUT"))
     if env.get("GITHUB_STEP_SUMMARY"):
         with open(env["GITHUB_STEP_SUMMARY"], "a") as summary:
             summary.write(markdown)

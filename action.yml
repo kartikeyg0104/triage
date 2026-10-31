@@ -19,6 +19,22 @@ inputs:
   github-token:
     description: Token used to read the diff and post the comment.
     default: ${{ github.token }}
+outputs:
+  verdict:
+    description: Overall verdict, one of supported, refuted or unverified.
+    value: ${{ steps.check.outputs.verdict }}
+  confirmed:
+    description: Number of claims confirmed.
+    value: ${{ steps.check.outputs.confirmed }}
+  refuted:
+    description: Number of claims refuted.
+    value: ${{ steps.check.outputs.refuted }}
+  unverified:
+    description: Number of claims left unverified.
+    value: ${{ steps.check.outputs.unverified }}
+  report-json:
+    description: Path of the JSON report written under $RUNNER_TEMP.
+    value: ${{ steps.check.outputs.report-json }}
 runs:
   using: composite
   steps:
@@ -29,6 +45,7 @@ runs:
       shell: bash
       run: python -m pip install --quiet "${{ github.action_path }}"
     - name: Check the claims
+      id: check
       shell: bash
       env:
         INPUT_PATH: ${{ inputs.path }}

@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -12,12 +13,7 @@ CASE_NAMES = sorted(p.name for p in CASES.iterdir() if p.is_dir()) if CASES.is_d
 
 # Cases the tool gets wrong today. Only misses that leave a claim unverified may be listed here:
 # a wrong confirmed or wrong refuted answer must fail.
-KNOWN_MISSES = {
-    "04_js_function": "the regex extractor treats a backticked lowerCamelCase name (`truncateSlug`) as prose, so that "
-                      "claim is never checked; the verdict is right only because the name happens to exist",
-    "14_symbol_removed_but_mentioned": "the removed function's name survives in a comment; any mention is treated as "
-                                       "a possible dynamic definition, so a false claim comes back unverified, not refuted",
-}
+KNOWN_MISSES: dict[str, str] = {}
 
 
 def case(claims, overall, repro=None, name="c"):
@@ -245,6 +241,161 @@ def test_main_skips_repro_cases_when_the_machine_has_no_isolation(tmp_path, monk
     assert "| r | | | | skipped (no sandbox isolation) |" in capsys.readouterr().out
 
 
+# --- the model (Gemma) path, with a fake model -----------------------------------------------
+# The real model path needs Ollama, which CI does not have; these tests replace the generate
+# function that extract_claims calls. docs/EVALUATION_GEMMA.md is the real run.
+
+MODEL_REPORT = "Crash in `parse_url()` when UrlParser gets an empty string"
+
+
+def fake_model(monkeypatch, reply=None, error=None):
+    """Make extract_claims call a fake generate function instead of Ollama."""
+    from claimcheck import extract
+
+    real = extract.extract_claims
+    calls = []
+
+    def generate(prompt):
+        calls.append(prompt)
+        if error is not None:
+            raise error
+        return json.dumps(reply)
+
+    monkeypatch.setattr(extract, "extract_claims", lambda report, generate_=generate: real(report, generate_))
+    return calls
+
+
+def model_case(tmp_path, name="m"):
+    path = make_case(tmp_path, name, report=MODEL_REPORT,
+                     data={"truth": "parse_url and UrlParser are both defined in urls.py",
+                           "expected": {"claims": {"symbol:parse_url": "confirmed"}, "overall": "supported"}})
+    (path / "repo" / "urls.py").write_text("def parse_url(s):\n    return s\n\nclass UrlParser:\n    pass\n")
+    return evaluate.load_case(path)
+
+
+def test_model_run_records_that_the_model_was_used(tmp_path, monkeypatch):
+    calls = fake_model(monkeypatch, {"symbols": ["UrlParser"], "repro_command": "", "expected_error": ""})
+    result = evaluate.run_case(model_case(tmp_path), runs=2, isolated=True, use_model=True)
+    assert len(calls) == 2
+    assert [run.model for run in result.runs] == ["gemma3:1b"] * 2
+    assert result.runs[0].claims == {"symbol:UrlParser": "confirmed", "symbol:parse_url": "confirmed"}
+
+
+def test_regex_run_records_no_model(tmp_path, monkeypatch):
+    calls = fake_model(monkeypatch, {"symbols": ["UrlParser"]})
+    result = evaluate.run_case(model_case(tmp_path), runs=1, isolated=True)
+    assert calls == [] and result.runs[0].model is None
+
+
+def test_a_run_that_fell_back_to_regex_is_not_reported_as_the_model(tmp_path, monkeypatch):
+    import urllib.error
+    fake_model(monkeypatch, error=urllib.error.URLError("connection refused"))
+    result = evaluate.run_case(model_case(tmp_path), runs=1, isolated=True, use_model=True)
+    assert result.runs[0].model is None
+    text = evaluate.to_markdown([result], {**META, "runs": "1", "model": "gemma3:1b"})
+    assert "- Extraction: gemma3:1b via Ollama in 0/1 runs; 1 run fell back to regex extraction (m)" in text
+    assert "gemma3:1b was not used in every run" in text
+
+
+def test_differing_names_are_reported_per_case(tmp_path, monkeypatch):
+    fake_model(monkeypatch, {"symbols": ["UrlParser", "not_in_report"]})
+    same = evaluate.load_case(make_case(tmp_path, "same"))
+    results = [evaluate.run_case(model_case(tmp_path), runs=1, isolated=True, use_model=True),
+               evaluate.run_case(same, runs=1, isolated=True, use_model=True)]
+    assert evaluate.name_differences(results[0]) == (["parse_url"], ["UrlParser", "parse_url"], ["UrlParser"], [])
+    assert evaluate.name_differences(results[1]) is None
+    text = evaluate.to_markdown(results, {**META, "runs": "1", "model": "gemma3:1b"})
+    assert "## Names that differ from regex extraction" in text
+    assert "| m | parse_url | UrlParser, parse_url | UrlParser | |" in text
+    assert "| same |" not in text.split("## Names that differ from regex extraction")[1].split("##")[0]
+    # The extra name is not in the truth, so the case is a miss, and it is shown as one.
+    assert "| m | `symbol:UrlParser` | not claimed | confirmed | miss |" in text
+
+
+def _metric_labels(text):
+    table = text.split("## Results")[1].split("\n\n")[1]
+    return [row.split("|")[1].strip() for row in table.splitlines()[2:]]
+
+
+def test_model_metrics_have_the_same_shape_as_the_regex_run(tmp_path, monkeypatch):
+    fake_model(monkeypatch, {"symbols": ["UrlParser"]})
+    loaded = model_case(tmp_path)
+    regex = evaluate.to_markdown(evaluate.evaluate([loaded], runs=1, isolated=True), {**META, "runs": "1"})
+    model_results = evaluate.evaluate([loaded], runs=1, isolated=True, use_model=True)
+    model = evaluate.to_markdown(model_results, {**META, "runs": "1", "model": "gemma3:1b"})
+    assert _metric_labels(model) == _metric_labels(regex) and len(_metric_labels(regex)) == 7
+    assert type(evaluate.summarize(model_results)) is evaluate.Summary
+    assert "use_model=True" in model and "use_model=False" in regex
+    assert "--model gemma3:1b" in model and "--model" not in regex
+    assert "## Names that differ" not in regex
+
+
+def test_main_with_the_model_uses_it_and_says_so(tmp_path, monkeypatch):
+    fake_model(monkeypatch, {"symbols": ["UrlParser"]})
+    monkeypatch.setattr(evaluate, "ollama_unavailable", lambda model: "")
+    cases, out = tmp_path / "cases", tmp_path / "EVAL_GEMMA.md"
+    model_case(cases)
+    assert evaluate.main(["--cases", str(cases), "--runs", "2", "--model", "gemma3:1b", "--out", str(out)]) == 0
+    text = out.read_text()
+    assert "# claimcheck evaluation: gemma3:1b extraction" in text
+    assert "- Extraction: gemma3:1b via Ollama in 2/2 runs" in text
+    assert "fell back" not in text
+
+
+def test_main_with_the_model_unreachable_skips_the_whole_run(tmp_path, monkeypatch, capsys):
+    calls = fake_model(monkeypatch, {"symbols": ["UrlParser"]})
+    monkeypatch.setattr(evaluate, "ollama_unavailable", lambda model: "Ollama not reachable at http://localhost:11434")
+    cases, out = tmp_path / "cases", tmp_path / "EVAL_GEMMA.md"
+    model_case(cases, "a")
+    model_case(cases, "b")
+    assert evaluate.main(["--cases", str(cases), "--model", "gemma3:1b", "--out", str(out)]) == 0
+    text = out.read_text()
+    assert calls == []
+    assert "**Skipped: Ollama not reachable at http://localhost:11434. No case was run with gemma3:1b.**" in text
+    assert "| Skipped (Ollama unreachable) | 2 |" in text
+    assert "| a | | | | skipped (Ollama unreachable) |" in text
+    assert "via Ollama in" not in text
+    assert "skipped" in capsys.readouterr().out
+
+
+def test_main_rejects_a_model_extract_does_not_use(tmp_path, capsys):
+    make_case(tmp_path, "a")
+    with pytest.raises(SystemExit):
+        evaluate.main(["--cases", str(tmp_path), "--model", "llama3"])
+    assert "gemma3:1b" in capsys.readouterr().err
+
+
+class _Response:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def test_ollama_unavailable_checks_the_server_and_the_model(monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def refused(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", refused)
+    assert "not reachable" in evaluate.ollama_unavailable("gemma3:1b")
+    tags = json.dumps({"models": [{"name": "llama3:8b"}]}).encode()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Response(tags))
+    assert "gemma3:1b" in evaluate.ollama_unavailable("gemma3:1b")
+    tags = json.dumps({"models": [{"name": "gemma3:1b"}]}).encode()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Response(tags))
+    assert evaluate.ollama_unavailable("gemma3:1b") == ""
+
+
 # --- the real cases --------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
@@ -266,6 +417,15 @@ def test_no_case_gets_a_wrong_confirmed_or_wrong_refuted(real_results):
 
 def test_real_cases_are_repeatable(real_results):
     assert [r.case.name for r in real_results if not r.repeatable] == []
+
+
+def test_real_cases_are_right_from_under_a_build_directory(tmp_path):
+    """Where a checkout lives must not change what is found in it. Repro cases are skipped: they
+    test the sandbox, not the static search."""
+    moved = tmp_path / "build" / "cases"
+    shutil.copytree(CASES, moved)
+    results = evaluate.evaluate(evaluate.load_cases(moved), runs=1, isolated=False)
+    assert [r.case.name for r in results if not r.skipped and r.case.name not in KNOWN_MISSES and not r.correct] == []
 
 
 @pytest.mark.parametrize("name", [
