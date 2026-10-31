@@ -1,0 +1,2 @@
+toTsv() does not escape tab characters inside a cell, so a cell containing a tab
+is split across two columns.

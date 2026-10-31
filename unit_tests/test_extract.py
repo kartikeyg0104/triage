@@ -65,3 +65,41 @@ def test_model_misses_are_filled_in_by_regex():
 def test_plain_backticked_words_are_not_symbols():
     result = extract.regex_extract("Set `path` and `repro`, then call `parse_url` and `Router` and `go()`.")
     assert {c.target for c in result.claims} == {"parse_url", "Router", "go"}
+
+
+def test_backticked_lower_camel_case_names_are_symbols():
+    result = extract.regex_extract("`truncateSlug` and `truncateSlg` break; `path`, `URL` and `slug` are prose.")
+    assert [c.target for c in result.claims] == ["truncateSlug", "truncateSlg"]
+
+
+def test_model_path_also_adds_a_lower_camel_case_name_the_model_missed():
+    result = extract.extract_claims("A crafted slug overflows `truncateSlg`.", fake({"symbols": []}))
+    assert [c.target for c in result.claims] == ["truncateSlg"]
+
+
+NO_CLAIMS = "The app feels slow on my laptop since the last update. It used to start\ninstantly. Please look into it.\n"
+
+
+def test_plain_prose_words_from_the_model_are_dropped():
+    # gemma3:1b returned these for eval case 12_no_checkable_claims (issue #40).
+    result = extract.extract_claims(NO_CLAIMS, fake({"symbols": ["app", "laptop"]}))
+    assert result.claims == []
+    assert result.model == extract.MODEL
+
+
+def test_model_names_are_kept_only_if_the_report_marks_them_as_code():
+    report = "Set the path, then parse_url breaks inside Router when go() runs on `fetch`."
+    result = extract.extract_claims(report, fake({"symbols": ["path", "parse_url", "Router", "go", "fetch"]}))
+    assert [c.target for c in result.claims] == ["parse_url", "Router", "go", "fetch"]
+
+
+def test_model_lower_camel_case_name_in_prose_is_kept():
+    result = extract.parse_model_output(json.dumps({"symbols": ["truncateSlug"]}), "truncateSlug cuts too much.")
+    assert [c.target for c in result.claims] == ["truncateSlug"]
+
+
+def test_plain_word_is_marked_only_by_its_own_call_or_backticks():
+    # `apply` and the prose word "app" do not mark app as code; app() does.
+    assert extract.parse_model_output(json.dumps({"symbols": ["app"]}), "Run `apply` on the app.").claims == []
+    kept = extract.parse_model_output(json.dumps({"symbols": ["app"]}), "The app breaks in app().")
+    assert [c.target for c in kept.claims] == ["app"]

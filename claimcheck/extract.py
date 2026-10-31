@@ -61,7 +61,7 @@ def parse_model_output(raw: str, report: str) -> Extraction | None:
         return None
     if not isinstance(data, dict):
         return None
-    symbols = [s for s in _clean_symbols(data.get("symbols")) if s in report]
+    symbols = [s for s in _clean_symbols(data.get("symbols")) if s in report and _marked_as_code(s, report)]
     command = str(data.get("repro_command") or "").strip()
     expected = str(data.get("expected_error") or "").strip()
     return Extraction(
@@ -73,8 +73,18 @@ def parse_model_output(raw: str, report: str) -> Extraction | None:
 
 
 def _looks_like_code(name: str) -> bool:
-    """A backticked plain word like `path` is prose; `parse_url` and `Router` look like code."""
-    return "_" in name or (name[0].isupper() and any(c.islower() for c in name))
+    """A backticked plain word like `path` (or `URL`) is prose; `parse_url`, `Router` and
+    `truncateSlug` look like code."""
+    return "_" in name or not (name.islower() or name.isupper())
+
+
+def _marked_as_code(name: str, report: str) -> bool:
+    """A model may return plain prose words ("app", "laptop") that do appear in the report.
+    Keep a name only if it looks like code or the report writes it as `name()` or `name`."""
+    if _looks_like_code(name):
+        return True
+    escaped = re.escape(name)
+    return re.search(rf"(?<![A-Za-z0-9_]){escaped}\(\)|`{escaped}(\(\))?`", report) is not None
 
 
 def regex_extract(report: str) -> Extraction:

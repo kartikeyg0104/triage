@@ -1,7 +1,8 @@
 """FastAPI app: run checks on request, and record signed GitHub webhook events.
 
 Neither endpoint runs a repro or any command taken from request or event text. Webhook
-events are only recorded (status "received"); nothing is fetched from GitHub.
+events are only recorded here (status "received"); `claimcheck.server.worker` checks them
+later. Nothing is fetched from GitHub.
 """
 
 import json
@@ -14,6 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from .. import report
 from ..cli import run_check
 from . import webhook
+from .paths import inside_root
 from .store import Store
 
 MAX_BODY = 1024 * 1024
@@ -46,12 +48,8 @@ async def read_body(request: Request, limit: int) -> bytes:
 
 
 def resolve_repo(root: Path, relative: str) -> Path:
-    """The repo must be a directory inside root once '..' and symlinks are resolved."""
-    try:
-        path = (root / relative).resolve()
-    except (OSError, ValueError):
-        raise HTTPException(400, "invalid repo path") from None
-    if not path.is_relative_to(root) or not path.is_dir():
+    path = inside_root(root, relative)
+    if path is None:
         raise HTTPException(400, "repo must be a directory inside the repo root")
     return path
 
