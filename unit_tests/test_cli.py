@@ -175,3 +175,23 @@ def test_rbac_denial_is_reported_as_an_unverified_rbac_setup_failure(repo, tmp_p
 
 def test_k8s_impersonate_is_in_the_help():
     assert "--k8s-impersonate" in cli.build_parser()._subparsers._group_actions[0].choices["check"].format_help()
+
+
+def test_sarif_flag_writes_the_file_and_keeps_stdout_and_exit_code(repo, tmp_path, capsys):
+    rep = write(tmp_path, "r.txt", "RCE in parse_url_v2()")
+    out_path = tmp_path / "out" / "claimcheck.sarif"
+    out_path.parent.mkdir()
+    code = cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model", "--sarif", str(out_path)])
+    assert code == 1
+    assert "**Verdict: refuted**" in capsys.readouterr().out
+    data = json.loads(out_path.read_text())
+    assert data["version"] == "2.1.0"
+    result = data["runs"][0]["results"][0]
+    assert result["ruleId"] == "claimcheck/symbol" and result["level"] == "error"
+    assert "parse_url_v2" in result["message"]["text"]
+
+
+def test_without_sarif_flag_no_file_is_written(repo, tmp_path):
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    assert cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model"]) == 0
+    assert not list(tmp_path.rglob("*.sarif"))
