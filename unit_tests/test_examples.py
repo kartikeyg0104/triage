@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def normalise(text: str) -> str:
-    return re.sub(r"`(sandbox-exec|unshare-net): ", "`SANDBOX: ", text)
+    text = re.sub(r"`(sandbox-exec|unshare-net): ", "`SANDBOX: ", text)
+    return re.sub(r"Tested revision: .*", "Tested revision: REV", text)
 
 
 @pytest.mark.skipif(sandbox.detect_isolation() is None, reason="needs sandbox isolation")

@@ -62,7 +62,7 @@ def test_diff_without_tests_is_reported(tmp_path):
     api = FakeApi()
     action.run(env(tmp_path, repo), api)
     post = [c for c in api.calls if c[0] == "POST"][0]
-    assert "no test covers the change" in post[2]["body"]
+    assert "existing tests may still cover it" in post[2]["body"]
 
 
 def test_does_not_fail_unless_asked(tmp_path):
