@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -257,3 +258,100 @@ def test_skipping_the_preflight_is_visible_in_the_source(repo):
 
 def test_probe_script_checks_api_and_internet():
     assert "1.1.1.1" in k8s.PROBE_SCRIPT and "KUBERNETES_SERVICE_HOST" in k8s.PROBE_SCRIPT
+
+
+# --- running as a least-privilege identity (kubectl --as) ------------------------------------
+
+EXECUTOR_SA = "system:serviceaccount:claimcheck:claimcheck-executor"
+
+
+def test_impersonate_adds_as_to_every_call_including_probe_and_cleanup(repo):
+    fake = FakeKubectl(exit_code=1, logs=[k8s.PROBE_OK, "RuntimeError: boom"])
+    evidence = executor(fake, require_network_isolation=True, impersonate=EXECUTOR_SA).run_repro(
+        repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.CONFIRMED
+    assert fake.verbs().count("apply") == 2 and fake.verbs().count("delete") == 2  # probe + repro
+    assert {"apply", "get", "logs", "delete"} <= set(fake.verbs())
+    for args, _ in fake.calls:
+        assert args.count("--as") == 1, args
+        assert args[args.index("--as") + 1] == EXECUTOR_SA
+
+
+def test_impersonate_also_applies_when_apply_fails(repo):
+    fake = FakeKubectl(apply_fails=True)
+    executor(fake, impersonate=EXECUTOR_SA).run_repro(repo, "true", "boom")
+    assert fake.verbs() == ["apply", "delete"]
+    assert all(args[args.index("--as") + 1] == EXECUTOR_SA for args, _ in fake.calls)
+
+
+def test_no_impersonation_by_default(repo):
+    fake = FakeKubectl(exit_code=1, logs=[k8s.PROBE_OK, "boom"])
+    executor(fake, require_network_isolation=True).run_repro(repo, "python3 poc.py", "boom")
+    assert fake.calls and not [args for args, _ in fake.calls if "--as" in args]
+
+
+# --- deploy/k8s: namespace, ServiceAccount, Role, RoleBinding --------------------------------
+
+DEPLOY = Path(__file__).resolve().parents[1] / "deploy" / "k8s"
+
+# Exactly what the executor's kubectl calls need, per (apiGroup, resource):
+#   apply -f - (client-side)              -> get (does it exist?), create; never patch: names are fresh
+#   delete ... -l <run> --wait=true       -> list (resolve the selector), delete, watch (wait)
+#   get pods -l <run> -o json             -> pods: list
+#   logs job/<name>                       -> jobs: get, pods: list, pods/log: get
+EXPECTED_RULES = {
+    ("", "configmaps"): {"get", "create", "list", "delete", "watch"},
+    ("networking.k8s.io", "networkpolicies"): {"get", "create", "list", "delete", "watch"},
+    ("batch", "jobs"): {"get", "create", "list", "delete", "watch"},
+    ("", "pods"): {"list"},
+    ("", "pods/log"): {"get"},
+}
+
+
+@pytest.fixture(scope="module")
+def manifests():
+    yaml = pytest.importorskip("yaml", reason="PyYAML not installed; the cluster tests cover deploy/k8s")
+    kustomization = yaml.safe_load((DEPLOY / "kustomization.yaml").read_text())
+    docs = []
+    for resource in kustomization["resources"]:
+        docs += [d for d in yaml.safe_load_all((DEPLOY / resource).read_text()) if d]
+    return {(d["kind"], d["metadata"]["name"]): d for d in docs}
+
+
+def test_namespace_enforces_restricted_pod_security(manifests):
+    labels = manifests[("Namespace", "claimcheck")]["metadata"]["labels"]
+    for mode in ("enforce", "audit", "warn"):
+        assert labels[f"pod-security.kubernetes.io/{mode}"] == "restricted"
+
+
+def test_service_account_does_not_automount_its_token(manifests):
+    sa = manifests[("ServiceAccount", "claimcheck-executor")]
+    assert sa["metadata"]["namespace"] == "claimcheck"
+    assert sa["automountServiceAccountToken"] is False
+
+
+def test_role_is_namespaced_and_least_privilege(manifests):
+    assert not [key for key in manifests if key[0] in ("ClusterRole", "ClusterRoleBinding")]
+    role = manifests[("Role", "claimcheck-executor")]
+    assert role["metadata"]["namespace"] == "claimcheck"
+    granted = {}
+    for rule in role["rules"]:
+        assert not rule.get("resourceNames") and not rule.get("nonResourceURLs")
+        for group in rule["apiGroups"]:
+            for resource in rule["resources"]:
+                granted.setdefault((group, resource), set()).update(rule["verbs"])
+    everything = {verb for verbs in granted.values() for verb in verbs}
+    assert "*" not in everything and not [key for key in granted if "*" in key]
+    assert not everything & {"escalate", "bind", "impersonate", "deletecollection", "update", "patch"}
+    resources = {resource for _, resource in granted}
+    assert not resources & {"secrets", "pods/exec", "pods/attach", "pods/portforward", "serviceaccounts/token",
+                            "roles", "rolebindings", "serviceaccounts"}
+    assert "create" not in granted.get(("", "pods"), set())  # pods come from the Job controller only
+    assert granted == EXPECTED_RULES
+
+
+def test_role_binding_grants_the_role_only_to_the_executor(manifests):
+    binding = manifests[("RoleBinding", "claimcheck-executor")]
+    assert binding["metadata"]["namespace"] == "claimcheck"
+    assert binding["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "claimcheck-executor"}
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "claimcheck-executor", "namespace": "claimcheck"}]
