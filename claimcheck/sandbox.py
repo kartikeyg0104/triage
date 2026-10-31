@@ -1,7 +1,8 @@
 """Run a reproduction command with no network, no secrets and a throwaway copy of the repo.
 
 Isolation is real or the run is refused: if the OS gives us no way to block the network,
-the claim stays UNVERIFIED instead of running untrusted code unprotected.
+the claim stays UNVERIFIED instead of running untrusted code unprotected. The sandbox does not
+block file reads, so the copy itself must not reach outside the repo (see repo_copy).
 """
 
 import os
@@ -9,12 +10,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 from .models import Claim, Evidence, Status
+from .repo_copy import copy_repo, describe_skipped
 
 _MAC_PROFILE = "(version 1)(allow default)(deny network*)"
-_IGNORE = shutil.ignore_patterns(".git", "node_modules", "__pycache__", ".venv")
 
 
 def detect_isolation() -> tuple[str, list[str]] | None:
@@ -49,7 +51,7 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
     name, prefix = isolation
     with tempfile.TemporaryDirectory(prefix="claimcheck-") as work:
         target = Path(work) / "repo"
-        shutil.copytree(repo, target, ignore=_IGNORE)
+        note = describe_skipped(copy_repo(repo, target))
         try:
             proc = subprocess.run(
                 prefix + ["sh", "-c", command],
@@ -60,9 +62,14 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            return Evidence(claim, Status.UNVERIFIED, f"timed out after {timeout}s", f"{name}: {command}")
+            return _with_note(Evidence(claim, Status.UNVERIFIED, f"timed out after {timeout}s", f"{name}: {command}"), note)
     output = (proc.stdout + proc.stderr).replace(str(target.resolve()), "<repo>").replace(str(target), "<repo>").strip()
-    return classify(claim, proc.returncode, output, expect, f"{name}: {command}")
+    return _with_note(classify(claim, proc.returncode, output, expect, f"{name}: {command}"), note)
+
+
+def _with_note(evidence: Evidence, note: str) -> Evidence:
+    """Say what the copy left out, so a run without those files is not mistaken for a full one."""
+    return replace(evidence, detail=f"{evidence.detail} (note: {note})") if note else evidence
 
 
 _SETUP_MARKERS = ("command not found", "ModuleNotFoundError", "ImportError", "Cannot find module",
