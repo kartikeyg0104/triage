@@ -44,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--base", help="git ref where the repro should fail (checks a fix claim; needs --head and --repro)")
     check.add_argument("--head", help="git ref that claims the fix; the repro must exit 0 there")
     check.add_argument("--json", action="store_true")
+    check.add_argument("--sarif", type=Path, metavar="PATH",
+                       help="also write a SARIF 2.1.0 file (e.g. for GitHub code scanning); stdout is unchanged")
     check.add_argument("--no-model", action="store_true", help="skip the model, use the regex extractor")
     check.add_argument("--executor", choices=["local", "kubernetes"], default="local",
                        help="where the repro runs: a local no-network process, or a locked-down Kubernetes Job")
@@ -77,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
     verdict, model = run_check(args.repo, args.report.read_text(), diff, args.repro, args.expect, not args.no_model,
                                run_repro, base=args.base, head=args.head)
     print((report.to_json if args.json else report.to_markdown)(verdict, model), end="")
+    if args.sarif:
+        args.sarif.write_text(report.to_sarif(verdict, model))
     return report.EXIT_CODE[verdict.outcome]
 
 
