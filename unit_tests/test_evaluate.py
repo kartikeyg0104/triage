@@ -440,3 +440,117 @@ def test_case_matches_ground_truth(name, real_results):
         pytest.skip(result.skipped)
     assert not (result.wrong_confirmed or result.wrong_refuted), name
     assert result.correct, [(key, result.case.claims.get(key), result.got(key)) for key in result.claim_keys()]
+
+
+# --- the JSON output and timing --------------------------------------------------------------
+
+def _markdown_metrics(text):
+    table = text.split("## Results")[1].split("\n\n")[1]
+    return {row.split("|")[1].strip(): row.split("|")[2].strip() for row in table.splitlines()[2:]}
+
+
+def _markdown_table(text, heading):
+    table = text.split(heading)[1].split("\n\n")[1]
+    return [[cell.strip() for cell in row.split("|")[1:-1]] for row in table.splitlines()[2:]]
+
+
+def assert_json_matches_markdown(data, text):
+    """Every number and per-case answer in the JSON is the one the markdown shows."""
+    m, runs, ratio = data["metrics"], data["runs_per_case"], evaluate._ratio
+    shown = _markdown_metrics(text)
+    plural = f"{runs} run" + ("" if runs == 1 else "s")
+    assert shown == {
+        "Per-claim accuracy": ratio(m["claims_correct"], m["claims_total"]),
+        "Overall-verdict accuracy": ratio(m["verdicts_correct"], m["scored"]),
+        "Wrong confirmed (cases)": str(m["wrong_confirmed"]),
+        "Wrong refuted (cases)": str(m["wrong_refuted"]),
+        "Unverified rate (verdicts)": f"{ratio(m['unverified'], m['scored'])}; ground truth "
+                                      f"{ratio(m['expected_unverified'], m['scored'])}",
+        f"Repeatability (identical across {plural})": ratio(m["repeatable"], m["scored"]),
+        next(k for k in shown if k.startswith("Skipped")): str(m["skipped"]),
+    }
+    assert f"- Cases: {m['cases']} ({m['scored']} scored, {m['skipped']} skipped)" in text
+    rows = []
+    for c in data["cases"]:
+        if c["skipped"]:
+            rows.append([c["name"], "", "", "", c["skipped"]])
+            continue
+        for claim in c["claims"]:
+            assert len(claim["got"]) == runs and claim["correct"] == (claim["label"] == "ok")
+            rows.append([c["name"], f"`{claim['key']}`", claim["expected"], evaluate._shown(claim["got"]), claim["label"]])
+        o = c["overall"]
+        assert len(o["got"]) == runs and [run["overall"] for run in c["runs"]] == o["got"]
+        rows.append([c["name"], "verdict", o["expected"], evaluate._shown(o["got"]), o["label"]])
+        assert all(run["seconds"] >= 0 for run in c["runs"])
+        assert c["seconds"] == round(sum(run["seconds"] for run in c["runs"]), 3)
+    assert _markdown_table(text, "## Per case") == rows
+    t = data["timing"]
+    assert t["runs"] == sum(len(c["runs"]) for c in data["cases"])
+    assert t["total_seconds"] == round(sum(run["seconds"] for c in data["cases"] for run in c["runs"]), 3)
+    assert f"- Wall-clock: {t['total_seconds']:.3f}s over {t['runs']} run" in text
+    assert _markdown_table(text, "## Slowest cases") == [[s["case"], f"{s['seconds']:.3f}"] for s in t["slowest"]]
+    by_name = {c["name"]: c["seconds"] for c in data["cases"]}
+    assert [s["seconds"] for s in t["slowest"]] == sorted((by_name[s["case"]] for s in t["slowest"]), reverse=True)
+
+
+def test_main_json_matches_the_markdown_on_real_cases(tmp_path):
+    cases, out, js = tmp_path / "cases", tmp_path / "EVAL.md", tmp_path / "out" / "eval.json"
+    for name in CASE_NAMES[:2]:
+        shutil.copytree(CASES / name, cases / name)
+    make_case(cases, "zz_wrong", report="RCE in `parse_url_v2()`",
+              data={"truth": "deliberately wrong for this test",
+                    "expected": {"claims": {"symbol:parse_url_v2": "unverified"}, "overall": "unverified"}})
+    assert evaluate.main(["--cases", str(cases), "--runs", "2", "--out", str(out), "--json", str(js)]) == 1
+    data = json.loads(js.read_text())
+    assert data["schema_version"] == evaluate.JSON_SCHEMA_VERSION == 1
+    assert data["runs_per_case"] == 2 and data["model"] is None
+    assert [c["name"] for c in data["cases"]] == CASE_NAMES[:2] + ["zz_wrong"]
+    assert data["metrics"]["wrong_refuted"] == 1
+    wrong = data["cases"][-1]
+    assert wrong["correct"] is False and wrong["wrong_refuted"] is True
+    assert wrong["claims"][0] == {"key": "symbol:parse_url_v2", "expected": "unverified",
+                                  "got": ["refuted", "refuted"], "label": "wrong refuted", "correct": False}
+    assert set(data["generated"]) >= {"date", "platform", "python", "revision", "uncommitted", "isolation"}
+    assert_json_matches_markdown(data, out.read_text())
+
+
+def test_main_json_with_the_model_records_the_model_per_run(tmp_path, monkeypatch, capsys):
+    fake_model(monkeypatch, {"symbols": ["UrlParser"]})
+    monkeypatch.setattr(evaluate, "ollama_unavailable", lambda model: "")
+    cases, js = tmp_path / "cases", tmp_path / "eval.json"
+    model_case(cases, "a")
+    make_case(cases, "b")
+    assert evaluate.main(["--cases", str(cases), "--runs", "2", "--model", "gemma3:1b", "--json", str(js)]) == 0
+    data = json.loads(js.read_text())
+    assert data["model"] == "gemma3:1b"
+    assert [run["model"] for c in data["cases"] for run in c["runs"]] == ["gemma3:1b"] * 4
+    assert data["cases"][0]["runs"][0]["claims"] == {"symbol:UrlParser": "confirmed", "symbol:parse_url": "confirmed"}
+    assert_json_matches_markdown(data, capsys.readouterr().out)
+
+
+def test_main_json_when_the_model_is_unreachable(tmp_path, monkeypatch):
+    monkeypatch.setattr(evaluate, "ollama_unavailable", lambda model: "Ollama not reachable")
+    cases, js = tmp_path / "cases", tmp_path / "eval.json"
+    model_case(cases, "a")
+    assert evaluate.main(["--cases", str(cases), "--model", "gemma3:1b", "--json", str(js),
+                          "--out", str(tmp_path / "x.md")]) == 0
+    data = json.loads(js.read_text())
+    assert data["skip_reason"] == "Ollama not reachable"
+    assert data["cases"][0]["skipped"] == "skipped (Ollama unreachable)" and data["cases"][0]["runs"] == []
+    assert data["timing"] == {"total_seconds": 0.0, "runs": 0, "slowest": []}
+
+
+def test_run_seconds_do_not_affect_repeatability():
+    a = Run({"symbol:f": "confirmed"}, "supported", seconds=0.1)
+    b = Run({"symbol:f": "confirmed"}, "supported", seconds=0.9)
+    assert CaseResult(case({"symbol:f": "confirmed"}, "supported"), [a, b]).repeatable
+
+
+def test_markdown_shows_total_time_and_the_slowest_cases():
+    fast = CaseResult(case({"symbol:f": "confirmed"}, "supported", name="fast"),
+                      [Run({"symbol:f": "confirmed"}, "supported", seconds=0.25)] * 2)
+    slow = CaseResult(case({"symbol:f": "confirmed"}, "supported", name="slow"),
+                      [Run({"symbol:f": "confirmed"}, "supported", seconds=1.5)] * 2)
+    text = evaluate.to_markdown([fast, slow], {**META, "runs": "2"})
+    assert "- Wall-clock: 3.500s over 4 runs" in text
+    assert "| slow | 3.000 |\n| fast | 0.500 |" in text
