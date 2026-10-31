@@ -127,4 +127,12 @@ CI runs the unit tests and local integration tests on every PR, builds a kind cl
 - The service's webhook records events but no worker processes them yet, and there is no GitHub App installation flow.
 - The evaluation cases are small and written by the team; Gemma extraction is not evaluated.
 
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and PR rules, and [SECURITY.md](SECURITY.md) to report a vulnerability privately.
+
 License: MIT.
+
+## Issue forms
+
+Bug reports and public security claims use the forms in `.github/ISSUE_TEMPLATE/` (affected function or class, repro command, expected error text, version or commit, description); blank issues are off, and anything security-sensitive goes to [private vulnerability reporting](https://github.com/kartikeyg0104/triage/security/advisories/new). `claimcheck/issue_form.py` reads a submitted form back out of the issue body as untrusted text: it only returns stripped, length-capped strings and never runs anything. The Action and CLI do not use the parser yet; wiring it in is a later PR.

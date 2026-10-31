@@ -1,0 +1,4 @@
+addItem() drops the quantity when fromJSON() loads a saved cart, so the total is off.
+formatPrice() rounds 199 cents down to "$1.98". isAllowed() is never consulted for
+restored items, clearCart() leaves stale items behind, and removeItem() throws when the
+cart is empty.

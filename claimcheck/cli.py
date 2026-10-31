@@ -44,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--base", help="git ref where the repro should fail (checks a fix claim; needs --head and --repro)")
     check.add_argument("--head", help="git ref that claims the fix; the repro must exit 0 there")
     check.add_argument("--json", action="store_true")
+    check.add_argument("--sarif", type=Path, metavar="PATH",
+                       help="also write a SARIF 2.1.0 file (e.g. for GitHub code scanning); stdout is unchanged")
     check.add_argument("--no-model", action="store_true", help="skip the model, use the regex extractor")
     check.add_argument("--executor", choices=["local", "kubernetes"], default="local",
                        help="where the repro runs: a local no-network process, or a locked-down Kubernetes Job")
@@ -51,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--k8s-image", default="python:3.12-slim")
     check.add_argument("--k8s-runtime-class", help="e.g. gvisor; only if the cluster has that RuntimeClass")
     check.add_argument("--kube-context", help="kubectl context to use")
+    check.add_argument("--k8s-impersonate", metavar="USER",
+                       help="run every kubectl call as USER (kubectl --as), e.g. "
+                            "system:serviceaccount:claimcheck:claimcheck-executor from deploy/k8s")
     return parser
 
 
@@ -69,10 +74,13 @@ def main(argv: list[str] | None = None) -> int:
     run_repro = sandbox.run_repro
     if args.executor == "kubernetes":
         run_repro = k8s.KubernetesExecutor(namespace=args.k8s_namespace, image=args.k8s_image,
-                                           runtime_class=args.k8s_runtime_class, context=args.kube_context).run_repro
+                                           runtime_class=args.k8s_runtime_class, context=args.kube_context,
+                                           impersonate=args.k8s_impersonate).run_repro
     verdict, model = run_check(args.repo, args.report.read_text(), diff, args.repro, args.expect, not args.no_model,
                                run_repro, base=args.base, head=args.head)
     print((report.to_json if args.json else report.to_markdown)(verdict, model), end="")
+    if args.sarif:
+        args.sarif.write_text(report.to_sarif(verdict, model))
     return report.EXIT_CODE[verdict.outcome]
 
 
