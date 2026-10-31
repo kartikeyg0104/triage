@@ -117,17 +117,22 @@ def test_all_objects_carry_the_run_label(repo):
 class FakeKubectl:
     """Records kubectl calls and answers like a cluster where the pod ends with `exit_code`."""
 
-    def __init__(self, exit_code=1, logs="Traceback\nRuntimeError: boom", pod_state=None, apply_fails=False):
+    def __init__(self, exit_code=1, logs="Traceback\nRuntimeError: boom", pod_state=None, apply_fails=False,
+                 forbid=None):
         # logs may be a list: one entry per pod run, in order (e.g. network probe, then the repro)
+        # forbid maps a kubectl verb to the stderr it fails with, e.g. an RBAC "is forbidden" message
         self.calls, self.exit_code = [], exit_code
         self.logs = list(logs) if isinstance(logs, list) else None
         self.fixed_logs = logs
         self.pod_state = pod_state
         self.apply_fails = apply_fails
+        self.forbid = forbid or {}
 
     def __call__(self, args, input=None, capture_output=True, text=True, timeout=None):
         self.calls.append((args, input))
         verb = args[args.index("kubectl") + 1] if "kubectl" in args else args[1]
+        if verb in self.forbid:
+            return subprocess.CompletedProcess(args, 1, "", self.forbid[verb])
         if verb == "apply":
             if self.apply_fails:
                 return subprocess.CompletedProcess(args, 1, "", "error: forbidden")
@@ -288,6 +293,119 @@ def test_no_impersonation_by_default(repo):
     fake = FakeKubectl(exit_code=1, logs=[k8s.PROBE_OK, "boom"])
     executor(fake, require_network_isolation=True).run_repro(repo, "python3 poc.py", "boom")
     assert fake.calls and not [args for args, _ in fake.calls if "--as" in args]
+
+
+# --- RBAC denials are setup failures, not NetworkPolicy problems or verdicts -------------------
+
+DEFAULT_SA = "system:serviceaccount:claimcheck:default"
+
+# Verbatim from kubectl v1.36 on kind, as system:serviceaccount:claimcheck:default.
+APPLY_FORBIDDEN = f"""Error from server (Forbidden): error when retrieving current configuration of:
+Resource: "/v1, Resource=configmaps", GroupVersionKind: "/v1, Kind=ConfigMap"
+Name: "claimcheck-abc", Namespace: "claimcheck"
+from server for: "STDIN": configmaps "claimcheck-abc" is forbidden: User "{DEFAULT_SA}" cannot get resource "configmaps" in API group "" in the namespace "claimcheck"
+Error from server (Forbidden): error when retrieving current configuration of:
+Resource: "networking.k8s.io/v1, Resource=networkpolicies", GroupVersionKind: "networking.k8s.io/v1, Kind=NetworkPolicy"
+Name: "claimcheck-abc", Namespace: "claimcheck"
+from server for: "STDIN": networkpolicies.networking.k8s.io "claimcheck-abc" is forbidden: User "{DEFAULT_SA}" cannot get resource "networkpolicies" in API group "networking.k8s.io" in the namespace "claimcheck"
+"""
+GET_PODS_FORBIDDEN = (f'Error from server (Forbidden): pods is forbidden: User "{DEFAULT_SA}" cannot list resource '
+                      '"pods" in API group "" in the namespace "claimcheck"')
+LOGS_FORBIDDEN = (f'Error from server (Forbidden): pods "claimcheck-abc-x" is forbidden: User "{DEFAULT_SA}" cannot get '
+                  'resource "pods/log" in API group "" in the namespace "claimcheck"')
+DELETE_FORBIDDEN = (f'Error from server (Forbidden): jobs.batch is forbidden: User "{DEFAULT_SA}" cannot list resource '
+                    '"jobs" in API group "batch" in the namespace "claimcheck"')
+IMPERSONATE_FORBIDDEN = ('Error from server (Forbidden): users "x" is forbidden: User "dev" cannot impersonate resource '
+                         '"users" in API group "" at the cluster scope')
+
+
+def test_rbac_denials_are_parsed_from_kubectl_errors():
+    denials = k8s.rbac_denials(APPLY_FORBIDDEN)
+    assert [(d.user, d.verb, d.resource, d.namespace) for d in denials] == [
+        (DEFAULT_SA, "get", "configmaps", "claimcheck"),
+        (DEFAULT_SA, "get", "networkpolicies.networking.k8s.io", "claimcheck")]
+    [log] = k8s.rbac_denials(LOGS_FORBIDDEN)
+    assert (log.verb, log.resource) == ("get", "pods/log")
+    [cluster] = k8s.rbac_denials(IMPERSONATE_FORBIDDEN)
+    assert (cluster.user, cluster.verb, cluster.resource, cluster.namespace) == ("dev", "impersonate", "users", None)
+
+
+@pytest.mark.parametrize("stderr", ["", "error: forbidden", "Unable to connect to the server: dial tcp: i/o timeout",
+                                    'pods "p" is forbidden: violates PodSecurity "restricted:latest": privileged'])
+def test_other_errors_are_not_rbac_denials(stderr):
+    assert k8s.rbac_denials(stderr) == []
+
+
+def test_rbac_denied_probe_is_an_rbac_failure_not_a_network_policy_problem(repo):
+    fake = FakeKubectl(forbid={"apply": APPLY_FORBIDDEN})
+    ex = executor(fake, require_network_isolation=True, impersonate=DEFAULT_SA)
+    evidence = ex.run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "RBAC setup failure" in evidence.detail and "network probe" in evidence.detail
+    assert "NetworkPolicy" not in evidence.detail
+    assert f'User "{DEFAULT_SA}" cannot get configmaps, get networkpolicies.networking.k8s.io' in evidence.detail
+    assert 'namespace "claimcheck"' in evidence.detail
+    assert "(egress not verified)" in evidence.source  # RBAC stopped the probe, so egress is unknown, not open
+    assert fake.verbs().count("apply") == 1  # the untrusted command never ran
+    assert ex.network_isolated() is False
+
+
+def test_rbac_denied_probe_is_not_retried_for_every_repro(repo):
+    fake = FakeKubectl(forbid={"apply": APPLY_FORBIDDEN})
+    ex = executor(fake, require_network_isolation=True)
+    for _ in range(2):
+        assert "RBAC setup failure" in ex.run_repro(repo, "python3 poc.py", "boom").detail
+    assert fake.verbs().count("apply") == 1
+
+
+def test_rbac_denied_apply_of_the_repro_names_the_permission(repo):
+    stderr = (f'Error from server (Forbidden): error when creating "STDIN": jobs.batch is forbidden: User "{DEFAULT_SA}" '
+              'cannot create resource "jobs" in API group "batch" in the namespace "claimcheck"')
+    fake = FakeKubectl(forbid={"apply": stderr})
+    evidence = executor(fake).run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "RBAC setup failure" in evidence.detail and "repro" in evidence.detail
+    assert "cannot create jobs.batch" in evidence.detail
+    assert fake.verbs()[-1] == "delete"
+
+
+def test_rbac_denied_pod_polling_fails_at_once_instead_of_timing_out(repo):
+    fake = FakeKubectl(forbid={"get": GET_PODS_FORBIDDEN})
+    evidence = executor(fake, deadline=1).run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "RBAC setup failure" in evidence.detail and "cannot list pods" in evidence.detail
+    assert "did not finish" not in evidence.detail
+    assert fake.verbs().count("get") == 1 and fake.verbs()[-1] == "delete"
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_rbac_denied_logs_never_become_a_verdict(repo, exit_code):
+    """Without logs an exit 0 would look like 'not reproduced'; it is a setup problem."""
+    fake = FakeKubectl(exit_code=exit_code, forbid={"logs": LOGS_FORBIDDEN})
+    evidence = executor(fake).run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "RBAC setup failure" in evidence.detail and "cannot get pods/log" in evidence.detail
+
+
+def test_rbac_denied_cleanup_keeps_the_result_but_says_objects_may_be_left(repo):
+    fake = FakeKubectl(exit_code=1, logs="RuntimeError: boom", forbid={"delete": DELETE_FORBIDDEN})
+    evidence = executor(fake).run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.CONFIRMED
+    assert "cleanup" in evidence.detail and "cannot list jobs.batch" in evidence.detail
+    assert "left behind" in evidence.detail
+
+
+def test_rbac_denied_cleanup_is_reported_with_an_rbac_failure(repo):
+    fake = FakeKubectl(forbid={"apply": APPLY_FORBIDDEN, "delete": DELETE_FORBIDDEN})
+    evidence = executor(fake).run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "cannot get configmaps, get networkpolicies.networking.k8s.io, list jobs.batch" in evidence.detail
+
+
+def test_unparsed_apply_errors_keep_the_generic_setup_failure(repo):
+    evidence = executor(FakeKubectl(apply_fails=True)).run_repro(repo, "true", "boom")
+    assert evidence.detail.startswith("setup failure: could not create the Job")
+    assert "RBAC" not in evidence.detail
 
 
 # --- deploy/k8s: namespace, ServiceAccount, Role, RoleBinding --------------------------------
