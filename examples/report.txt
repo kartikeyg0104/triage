@@ -1,0 +1,5 @@
+Security report: remote code execution in parse_url_v2().
+
+Passing a very long URL to the parser triggers a buffer overflow. Reproduce with
+`python3 poc.py` and you get "buffer overflow in parse_url". Also the older
+`parse_url` helper looks affected.
