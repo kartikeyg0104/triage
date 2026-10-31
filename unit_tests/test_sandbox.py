@@ -86,6 +86,48 @@ def test_temp_path_is_not_leaked(tmp_path):
     assert "<repo>" in evidence.detail
 
 
+HOST_SECRET = "BEGIN-HOST-PRIVATE-KEY-7f3a9c"
+
+
+@pytest.fixture
+def repo_beside_secret(tmp_path):
+    """The secret lives outside the repo, the way ~/.ssh/id_rsa lives outside a checkout."""
+    secret = tmp_path / "id_rsa"
+    secret.write_text(HOST_SECRET + "\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    return repo, secret
+
+
+@needs_isolation
+@pytest.mark.parametrize("absolute", [True, False])
+def test_symlink_to_host_file_is_not_leaked(repo_beside_secret, absolute):
+    repo, secret = repo_beside_secret
+    (repo / "leak").symlink_to(secret if absolute else "../id_rsa")
+    evidence = sandbox.run_repro(repo, "cat leak; exit 1", HOST_SECRET)
+    assert HOST_SECRET not in evidence.detail
+    assert evidence.status is not Status.CONFIRMED
+    assert "1 symlink pointing outside the repo was not copied" in evidence.detail
+
+
+@needs_isolation
+def test_symlink_to_host_directory_is_not_leaked(repo_beside_secret):
+    repo, secret = repo_beside_secret
+    (repo / "ssh").symlink_to(secret.parent)
+    evidence = sandbox.run_repro(repo, "cat ssh/id_rsa; exit 1", HOST_SECRET)
+    assert HOST_SECRET not in evidence.detail
+
+
+@needs_isolation
+def test_inside_repo_symlink_still_works(repo_beside_secret):
+    repo, _ = repo_beside_secret
+    (repo / "data.txt").write_text("inside-content\n")
+    (repo / "alias").symlink_to("data.txt")
+    evidence = sandbox.run_repro(repo, "cat alias; exit 1", "inside-content")
+    assert evidence.status is Status.CONFIRMED
+    assert "not copied" not in evidence.detail
+
+
 CLAIM = Claim("repro", "r")
 
 
