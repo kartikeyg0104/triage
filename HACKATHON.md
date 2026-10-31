@@ -21,7 +21,7 @@ A GitHub App that checks whether a bug report, security report or pull request c
 
 ## Models
 
-**Models the product uses at runtime:** none decided yet. We will only list an open-weight model here, with the reason, in the PR that actually integrates it. We will not claim a model the code does not use.
+**Models the product uses at runtime:** `gemma3:1b` (open-weight, Google Gemma) through Ollama on the local machine. It reads a free-text report and lists the function names, the repro command and the expected error in it. We chose it because it is open-weight, small enough to run on a laptop with no API key, and fast enough for a CI-style check. Its output is validated: names not in the report are dropped, and a regex pass adds any `name()` it missed. If Ollama is not running, the tool falls back to regex and says so in the report. No cloud AI APIs are used.
 
 ## Workflow
 
