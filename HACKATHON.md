@@ -17,7 +17,7 @@
 
 **Problem 2: Triage that tests the claims.**
 
-A GitHub App that checks whether a bug report, security report or pull request claim is true, and shows maintainers the evidence. Claims are tested safely in an isolated sandbox with no secrets and no network. Examples of the evidence it produces: "reproduced on 2.4.1", "`parse_url_v2()` does not exist", "no test covers this change".
+A tool (a command-line tool today; a GitHub App is not built yet) that checks whether a bug report, security report or pull request claim is true, and shows maintainers the evidence. Claims are tested safely in an isolated sandbox with no secrets and no network. Examples of the evidence it produces: "reproduced on 2.4.1", "`parse_url_v2()` does not exist", "no test covers this change".
 
 ## Models
 
