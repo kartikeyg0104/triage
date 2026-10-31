@@ -75,3 +75,11 @@ def test_repo_is_copied_not_modified(tmp_path):
     (tmp_path / "w.py").write_text("open('created.txt','w').write('x')\nraise SystemExit(1)\n")
     sandbox.run_repro(tmp_path, "python3 w.py", "")
     assert not (tmp_path / "created.txt").exists()
+
+
+@needs_isolation
+def test_temp_path_is_not_leaked(tmp_path):
+    (tmp_path / "p.py").write_text("import os\nraise RuntimeError(os.getcwd())\n")
+    evidence = sandbox.run_repro(tmp_path, "python3 p.py", "")
+    assert "/var/" not in evidence.detail and "/tmp/" not in evidence.detail
+    assert "<repo>" in evidence.detail
