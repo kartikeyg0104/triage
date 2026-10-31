@@ -38,13 +38,30 @@ Add `--json` for JSON output, or `--no-model` to skip Gemma and use the regex ex
 
 ## Models
 
-`gemma3:1b` through Ollama reads the report and lists the names and repro command in it. Names the model returns that are not in the report are dropped, and names written as `` `name()` `` are always added, so a small model cannot hide a claim. If Ollama is not running, the regex extractor is used and the report says so. There are no cloud AI calls.
+`gemma3:1b` through Ollama reads the report and lists the names and repro command in it. Names the model returns that are not in the report are dropped, and names written as `name()` are always added, so a small model cannot hide a claim. If Ollama is not running, the regex extractor is used and the report says so. There are no cloud AI calls.
 
 ## Limits
 
 - The sandbox is process-level isolation, not a container or gVisor. It stops network and secret access, not every kind of misbehaviour. Do not use it on hostile code you would not otherwise run.
-- A 1B model misses some claims on its own. The regex pass covers `name()` and backticked names only.
+- A 1B model misses some claims on its own. The regex pass covers `name()` and backticked names that look like code (with an underscore, or CamelCase); a plain backticked word is treated as prose.
 - JS/TS symbol detection is pattern-based, so unusual definitions can be missed.
-- It is a CLI. There is no GitHub App yet.
+- There is a CLI and a GitHub Action (`action.yml`, regex extraction, no model on the runner). There is no GitHub App.
 
 License: MIT.
+
+## GitHub Action
+
+```yaml
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+permissions: { contents: read, pull-requests: write, issues: write }
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kartikeyg0104/triage@main
+```
+
+It reads the PR title and body, checks the symbols and whether the diff touches tests, and posts one comment (updated in place on every push). The PR text is treated as untrusted: it never reaches a shell, and a repro command found in it is never run. Set the `repro` and `expect` inputs in the workflow to run a repro of your own in the sandbox. Inputs: `path`, `repro`, `expect`, `comment`, `fail-on-refuted` (default `false`).

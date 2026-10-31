@@ -60,3 +60,8 @@ def test_model_misses_are_filled_in_by_regex():
     result = extract.extract_claims(REPORT, fake({"symbols": ["Router"]}))
     assert {c.target for c in result.claims} == {"Router", "parse_url_v2"}
     assert result.model == extract.MODEL
+
+
+def test_plain_backticked_words_are_not_symbols():
+    result = extract.regex_extract("Set `path` and `repro`, then call `parse_url` and `Router` and `go()`.")
+    assert {c.target for c in result.claims} == {"parse_url", "Router", "go"}
