@@ -1,0 +1,12 @@
+{
+  "truth": "The repo contains two top-level Python packages: inventory (with io and core subpackages) and reporting, which imports inventory. read_stock_rows and StockRow are defined in inventory/io/readers.py, total_quantity in inventory/core/totals.py and build_summary in reporting/summary.py. All four import and are callable. Executing read_stock_rows on a header and two data rows returns only the first StockRow because of rows[:-1]; total_quantity returns 2 instead of 5, and build_summary returns one row with quantity 2. The checked claims establish these names exist, not that every narrative bug claim was verified.",
+  "expected": {
+    "claims": {
+      "symbol:read_stock_rows": "confirmed",
+      "symbol:total_quantity": "confirmed",
+      "symbol:StockRow": "confirmed",
+      "symbol:build_summary": "confirmed"
+    },
+    "overall": "supported"
+  }
+}
