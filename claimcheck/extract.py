@@ -72,10 +72,15 @@ def parse_model_output(raw: str, report: str) -> Extraction | None:
     )
 
 
+def _looks_like_code(name: str) -> bool:
+    """A backticked plain word like `path` is prose; `parse_url` and `Router` look like code."""
+    return "_" in name or (name[0].isupper() and any(c.islower() for c in name))
+
+
 def regex_extract(report: str) -> Extraction:
-    """No model: find `name()` and backticked identifiers."""
+    """No model: find `name()` calls and backticked names that look like code."""
     names = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)\(\)`?", report)
-    names += re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", report)
+    names += [n for n in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", report) if _looks_like_code(n)]
     return Extraction(claims=[Claim("symbol", f"{s}() exists", s) for s in _clean_symbols(names)])
 
 
