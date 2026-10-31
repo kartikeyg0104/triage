@@ -258,3 +258,8 @@ def test_limit_hits_are_recognised(code, output):
 @pytest.mark.parametrize("code,output", [(1, "KeyError: x"), (0, "fine"), (2, "usage: poc")])
 def test_ordinary_failures_are_not_limit_hits(code, output):
     assert sandbox.limit_hit(code, output) is None
+
+
+def test_shell_cannot_fork_counts_as_a_limit_hit():
+    # Linux dash reports a hit process limit as "sh: 1: Cannot fork"; seen on CI.
+    assert sandbox.limit_hit(2, "sh: 1: Cannot fork")
