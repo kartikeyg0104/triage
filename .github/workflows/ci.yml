@@ -34,6 +34,13 @@ jobs:
           install_only: true
       - name: Create kind cluster with Calico
         run: deploy/kind/setup.sh claimcheck
+      - name: Apply least-privilege RBAC and restricted Pod Security (deploy/k8s)
+        # setup.sh created namespace claimcheck; this labels it and adds the executor's ServiceAccount and Role.
+        run: |
+          kubectl --context kind-claimcheck apply -k deploy/k8s
+          kubectl --context kind-claimcheck get namespace claimcheck --show-labels
+          kubectl --context kind-claimcheck auth can-i create jobs.batch -n claimcheck \
+            --as system:serviceaccount:claimcheck:claimcheck-executor
       - name: Install
         run: python -m pip install -e ".[dev]"
       - name: Integration tests on the cluster
