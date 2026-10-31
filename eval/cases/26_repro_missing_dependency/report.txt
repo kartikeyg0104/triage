@@ -1,0 +1,3 @@
+best_match() crashes on an empty candidate list instead of returning None:
+`python3 poc.py` fails with "ValueError: max() iterable argument is empty".
+(pip install -r requirements.txt first.)
