@@ -1,0 +1,7 @@
+{
+  "truth": "slugify is a function declaration at repo/src/slug.js:1. truncateSlg does not exist: the repo defines truncateSlug (repo/src/slug.js:5) and exports only slugify and truncateSlug through a literal object, with no dynamic exports. truncateSlg appears nowhere in the code, so the headline function does not exist.",
+  "expected": {
+    "claims": {"symbol:truncateSlg": "refuted", "symbol:slugify": "confirmed"},
+    "overall": "refuted"
+  }
+}
