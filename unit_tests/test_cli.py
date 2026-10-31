@@ -197,11 +197,128 @@ def test_without_sarif_flag_no_file_is_written(repo, tmp_path):
     assert not list(tmp_path.rglob("*.sarif"))
 
 
+# Issue #78: --model-name picks the Ollama model.
+
+def test_model_name_flag_picks_the_model_and_the_report_names_it(repo, tmp_path, monkeypatch, capsys):
+    from test_extract import fake_ollama
+    monkeypatch.delenv("CLAIMCHECK_MODEL", raising=False)
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()` on long input")
+    with fake_ollama({"symbols": ["parse_url"]}, known=("qwen3:0.6b",)) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        code = cli.main(["check", "--repo", str(repo), "--report", rep, "--model-name", "qwen3:0.6b", "--json"])
+        assert code == 0
+        assert json.loads(capsys.readouterr().out)["extraction_model"] == "qwen3:0.6b"
+        cli.main(["check", "--repo", str(repo), "--report", rep, "--model-name", "qwen3:0.6b"])
+        assert "Claim extraction: qwen3:0.6b" in capsys.readouterr().out
+    assert [r["body"]["model"] for r in requests] == ["qwen3:0.6b", "qwen3:0.6b"]
+
+
+def test_model_name_flag_overrides_claimcheck_model(repo, tmp_path, monkeypatch, capsys):
+    from test_extract import fake_ollama
+    monkeypatch.setenv("CLAIMCHECK_MODEL", "from-env:1b")
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    with fake_ollama({"symbols": ["parse_url"]}, known=("from-env:1b", "from-flag:2b")) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        cli.main(["check", "--repo", str(repo), "--report", rep, "--json"])
+        cli.main(["check", "--repo", str(repo), "--report", rep, "--model-name", "from-flag:2b", "--json"])
+    assert [r["body"]["model"] for r in requests] == ["from-env:1b", "from-flag:2b"]
+
+
+def test_unknown_model_name_falls_back_to_regex_and_the_report_says_so(repo, tmp_path, monkeypatch, capsys):
+    from test_extract import fake_ollama
+    monkeypatch.delenv("CLAIMCHECK_MODEL", raising=False)
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    with fake_ollama({"symbols": ["parse_url"]}) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        code = cli.main(["check", "--repo", str(repo), "--report", rep, "--model-name", "nosuch:7b"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "regex fallback" in captured.out
+    assert "nosuch:7b" in captured.out and "not found" in captured.out
+    assert "nosuch:7b" in captured.err and "not found" in captured.err
+
+
+def test_model_name_is_in_the_help():
+    help_text = cli.build_parser()._subparsers._group_actions[0].choices["check"].format_help()
+    assert "--model-name" in help_text and "CLAIMCHECK_MODEL" in help_text
+
+
+@pytest.mark.parametrize("format", ["markdown", "json", "sarif"])
+def test_report_names_the_model_in_the_server_reply(repo, tmp_path, monkeypatch, capsys, format):
+    from test_extract import fake_ollama
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    output = tmp_path / "result.sarif"
+    flags = ["--json"] if format == "json" else ["--sarif", str(output)] if format == "sarif" else []
+    with fake_ollama({"symbols": ["parse_url"]}, known=("gemma3",), answer_as="gemma3:latest") as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        assert cli.main(["check", "--repo", str(repo), "--report", rep, "--model-name", "gemma3", *flags]) == 0
+    stdout = capsys.readouterr().out
+    if format == "json":
+        assert json.loads(stdout)["extraction_model"] == "gemma3:latest"
+    elif format == "sarif":
+        assert json.loads(output.read_text())["runs"][0]["properties"]["extractionModel"] == "gemma3:latest"
+    else:
+        assert "Claim extraction: gemma3:latest" in stdout
+    assert requests[0]["body"]["model"] == "gemma3"
+
+
+@pytest.mark.parametrize("format", ["markdown", "json", "sarif"])
+def test_unknown_model_setup_note_is_unverified_in_each_report(repo, tmp_path, monkeypatch, capsys, format):
+    from test_extract import fake_ollama
+    rep = write(tmp_path, "r.txt", "It feels slow")
+    output = tmp_path / "result.sarif"
+    flags = ["--json"] if format == "json" else ["--sarif", str(output)] if format == "sarif" else []
+    with fake_ollama({}) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        code = cli.main(["check", "--repo", str(repo), "--report", rep, "--model-name", "nosuch:7b", *flags])
+    assert code == 2
+    captured = capsys.readouterr()
+    if format == "markdown":
+        assert "unverified" in captured.out and "nosuch:7b" in captured.out and "not found" in captured.out
+    elif format == "json":
+        data = json.loads(captured.out)
+        assert data["verdict"] == "unverified" and data["extraction_model"] is None
+        assert len(data["evidence"]) == 1 and data["evidence"][0]["status"] == "unverified"
+        assert "nosuch:7b" in data["evidence"][0]["detail"] and "regex" in data["evidence"][0]["detail"]
+    else:
+        run = json.loads(output.read_text())["runs"][0]
+        assert run["properties"]["extractionModel"] is None
+        assert len(run["results"]) == 1 and run["results"][0]["level"] == "warning"
+        assert run["results"][0]["properties"]["status"] == "unverified"
+        assert "nosuch:7b" in run["results"][0]["message"]["text"]
+    assert requests[0]["body"]["model"] == "nosuch:7b"
+
+
+def test_invalid_host_setup_note_is_in_the_report(repo, tmp_path, monkeypatch, capsys):
+    from test_extract import fake_ollama
+    rep = write(tmp_path, "r.txt", "It feels slow")
+    with fake_ollama({}) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", "file:///etc/passwd")
+        assert cli.main(["check", "--repo", str(repo), "--report", rep, "--json"]) == 2
+    data = json.loads(capsys.readouterr().out)
+    assert requests == []
+    assert len(data["evidence"]) == 1 and data["evidence"][0]["status"] == "unverified"
+    assert "OLLAMA_HOST" in data["evidence"][0]["detail"]
+
+
+def test_no_model_skips_host_and_model_settings(repo, tmp_path, monkeypatch, capsys):
+    from test_extract import fake_ollama
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    with fake_ollama({}) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        monkeypatch.setenv("CLAIMCHECK_MODEL", "nosuch:7b")
+        assert cli.main(["check", "--repo", str(repo), "--report", rep,
+                         "--no-model", "--model-name", "also-missing:1b", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert requests == [] and captured.err == ""
+    assert json.loads(captured.out)["extraction_model"] is None
+
 # Issue #73: the truncation flag reaches the verdict and every output.
 
 class FakeOllamaResponse:
     def __init__(self, answer):
-        self.body = json.dumps({"response": json.dumps(answer)}).encode()
+        # Real Ollama /api/generate responses name the model that answered.
+        self.body = json.dumps({"model": extract.MODEL, "response": json.dumps(answer)}).encode()
 
     def read(self, *args):
         body, self.body = self.body, b""
