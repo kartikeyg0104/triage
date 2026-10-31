@@ -16,7 +16,8 @@ python -m claimcheck check \
 - Both refs are resolved to full commit SHAs with `git rev-parse --verify <ref>^{commit}`.
 - Each SHA is checked out as a detached `git worktree` in a temp dir, with git hooks disabled. Your checkout, branch, index and working tree are not touched, and uncommitted edits do not leak into either side.
 - The repro runs in that worktree with the chosen executor, which judges each side exactly as it judges a single `--repro`.
-- Each worktree is removed afterwards, even if the executor fails. `git worktree prune` only runs if removing ours failed, because it would also drop your own stale worktrees.
+- Both worktrees are created first, one after the other, because concurrent `git worktree add` calls on one repo can race. Then base and head run at the same time, each in its own worktree with its own executor call, so the check takes about as long as the slower side. The local sandbox copies each side to its own temp dir, and the Kubernetes executor gives each Job a unique name. The result, detail and SHAs are the same as if the sides ran one after the other.
+- Each worktree is removed afterwards, even if the executor fails. If one side raises, the other side is allowed to finish, both worktrees are removed, and the error is re-raised. `git worktree prune` only runs if removing ours failed, because it would also drop your own stale worktrees.
 - If `--repo` is a subdirectory of the git repo, the repro runs in the same subdirectory of each revision.
 
 The command comes only from `--repro`. Text in the report or PR is never run.
