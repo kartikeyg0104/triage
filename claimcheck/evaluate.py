@@ -12,6 +12,27 @@ a wrong definite answer misleads them.
 With --model the same cases go through model extraction (Gemma via Ollama, with the regex names
 merged in). Every run records whether the model was really used or extraction fell back to
 regex, and if Ollama cannot be reached nothing is run and the whole report says skipped.
+
+--json PATH also writes the results as JSON (the markdown is still written to --out or stdout,
+and both are made from the same numbers). Schema version 1:
+
+    schema_version   1; bumped when a field changes meaning or is removed
+    generated        date, platform, python, revision, uncommitted (bool), isolation
+    model            the --model name, or null for regex extraction
+    skip_reason      why the whole run was skipped (Ollama unreachable), or null
+    runs_per_case    --runs
+    metrics          cases, scored, skipped, claims_total, claims_correct, verdicts_correct,
+                     wrong_confirmed, wrong_refuted (cases), unverified, expected_unverified,
+                     repeatable: the counts behind the markdown Results table
+    timing           total_seconds (sum of every run's wall-clock time), runs (how many),
+                     slowest: [{case, seconds}] the slowest cases, all runs of each summed
+    cases            [{name, skipped (reason or null), correct, repeatable, wrong_confirmed,
+                     wrong_refuted, seconds, claims: [{key, expected, got (one per run), label,
+                     correct}], overall: {expected, got, label, correct},
+                     runs: [{seconds, model, claims: {key: status}, overall}]}]
+
+Labels are those of the markdown Per case table: ok, miss, wrong confirmed, wrong refuted.
+Seconds are wall-clock and rounded to milliseconds.
 """
 
 import argparse
@@ -21,6 +42,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -34,6 +56,8 @@ SKIP_NO_MODEL = "skipped (Ollama unreachable)"
 MISSING = "missing"  # the truth lists a claim the tool did not produce
 NOT_CLAIMED = "not claimed"  # the tool produced a claim the report does not make
 OUTCOMES = ("supported", "refuted", "unverified")
+JSON_SCHEMA_VERSION = 1
+SLOWEST = 5  # cases listed under the timing
 ROOT = Path(__file__).resolve().parent.parent
 _STATUSES = tuple(s.value for s in Status)
 _CLAIM_KEY = re.compile(r"^(pr_tests|repro|symbol:[A-Za-z_][A-Za-z0-9_]*)$")
@@ -64,6 +88,7 @@ class Run:
     claims: dict[str, str]
     overall: str
     model: str | None = None  # the model run_check reports it used; None is regex extraction
+    seconds: float = field(default=0.0, compare=False)  # wall-clock; not part of what the tool said
 
     @property
     def names(self) -> list[str]:
@@ -79,6 +104,10 @@ class CaseResult:
     @property
     def repeatable(self) -> bool:
         return all(run == self.runs[0] for run in self.runs)
+
+    @property
+    def seconds(self) -> float:
+        return _seconds(sum(run.seconds for run in self.runs))
 
     def claim_keys(self) -> list[str]:
         keys = list(self.case.claims)
@@ -229,9 +258,11 @@ def _claim_key(claim: Claim) -> str:
 
 
 def run_once(case: Case, use_model: bool = False) -> Run:
+    start = time.perf_counter()
     verdict, model = cli.run_check(case.repo, case.report, case.diff, case.repro, case.expect, use_model=use_model,
                                    run_repro=sandbox.run_repro)
-    return Run({_claim_key(e.claim): e.status.value for e in verdict.evidence}, verdict.outcome, model)
+    seconds = _seconds(time.perf_counter() - start)  # rounded once, so every total adds up from what is shown
+    return Run({_claim_key(e.claim): e.status.value for e in verdict.evidence}, verdict.outcome, model, seconds)
 
 
 def run_case(case: Case, runs: int, isolated: bool, use_model: bool = False) -> CaseResult:
@@ -272,6 +303,20 @@ def name_differences(result: CaseResult) -> tuple[list[str], list[str], list[str
 
 def _ratio(part: int, whole: int) -> str:
     return f"{part}/{whole} ({part / whole:.0%})" if whole else "0/0 (n/a)"
+
+
+def _seconds(value: float) -> float:
+    return round(value, 3)
+
+
+def timing(results: list[CaseResult]) -> dict:
+    """Wall-clock totals, shared by the markdown and the JSON so the two cannot disagree."""
+    ran = sorted((r for r in results if r.runs), key=lambda r: r.seconds, reverse=True)
+    return {
+        "total_seconds": _seconds(sum(run.seconds for r in results for run in r.runs)),
+        "runs": sum(len(r.runs) for r in results),
+        "slowest": [{"case": r.case.name, "seconds": r.seconds} for r in ran[:SLOWEST]],
+    }
 
 
 def _label(expected: str, got: list[str]) -> str:
@@ -331,7 +376,7 @@ def _difference_lines(results: list[CaseResult]) -> list[str]:
 
 
 def to_markdown(results: list[CaseResult], meta: dict[str, str]) -> str:
-    s = summarize(results)
+    s, t = summarize(results), timing(results)
     model = meta.get("model")
     model_skipped = any(r.skipped == SKIP_NO_MODEL for r in results)
     runs = meta["runs"] + (" run" if meta["runs"] == "1" else " runs")
@@ -355,6 +400,7 @@ def to_markdown(results: list[CaseResult], meta: dict[str, str]) -> str:
         f"- Sandbox: {meta['isolation']}",
         f"- Cases: {s.cases} ({s.scored} scored, {s.skipped} skipped), {runs} each",
         pipeline,
+        f"- Wall-clock: {t['total_seconds']:.3f}s over {_plural(t['runs'], 'run')} (sum of per-run times)",
     ]
     if model:
         lines += _model_lines(results, model)
@@ -392,6 +438,12 @@ def to_markdown(results: list[CaseResult], meta: dict[str, str]) -> str:
         lines.append("None.")
     if model and not model_skipped:
         lines += _difference_lines(results)
+    lines += ["", "## Slowest cases", ""]
+    if t["slowest"]:
+        lines += ["| Case | Seconds (all runs) |", "|---|---|"]
+        lines += [f"| {slow['case']} | {slow['seconds']:.3f} |" for slow in t["slowest"]]
+    else:
+        lines.append("None: no case was run.")
     lines += ["", "## Per case", "", "| Case | Claim | Expected | Got | |", "|---|---|---|---|---|"]
     for r in results:
         if r.skipped:
@@ -401,6 +453,44 @@ def to_markdown(results: list[CaseResult], meta: dict[str, str]) -> str:
     lines += ["", "## Ground truth", "", "| Case | Why the expected answers are right |", "|---|---|"]
     lines += [f"| {r.case.name} | {_cell(r.case.truth)} |" for r in results]
     return "\n".join(lines) + "\n"
+
+
+def _answer(expected: str, got: list[str]) -> dict:
+    label = _label(expected, got)
+    return {"expected": expected, "got": got, "label": label, "correct": label == "ok"}
+
+
+def _case_json(r: CaseResult) -> dict:
+    return {
+        "name": r.case.name,
+        "skipped": r.skipped or None,
+        "correct": not r.skipped and r.correct,
+        "repeatable": not r.skipped and r.repeatable,
+        "wrong_confirmed": not r.skipped and r.wrong_confirmed,
+        "wrong_refuted": not r.skipped and r.wrong_refuted,
+        "seconds": r.seconds,
+        "claims": [] if r.skipped else [{"key": key, **_answer(r.expected(key), r.got(key))} for key in r.claim_keys()],
+        "overall": None if r.skipped else _answer(r.case.overall, [run.overall for run in r.runs]),
+        "runs": [{"seconds": run.seconds, "model": run.model, "claims": run.claims, "overall": run.overall}
+                 for run in r.runs],
+    }
+
+
+def to_json(results: list[CaseResult], meta: dict[str, str]) -> dict:
+    """The same results as to_markdown, as data; the schema is in the module docstring."""
+    s = summarize(results)
+    metrics = {name: getattr(s, name) for name in Summary.__dataclass_fields__}
+    return {
+        "schema_version": JSON_SCHEMA_VERSION,
+        "generated": {key: meta.get(key, "") for key in ("date", "platform", "python", "revision", "isolation")}
+                     | {"uncommitted": bool(meta.get("uncommitted"))},
+        "model": meta.get("model"),
+        "skip_reason": meta.get("skip_reason"),
+        "runs_per_case": int(meta["runs"]),
+        "metrics": metrics | {"scored": s.scored},
+        "timing": timing(results),
+        "cases": [_case_json(r) for r in results],
+    }
 
 
 def _uncommitted() -> bool:
@@ -430,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases", type=Path, default=Path("eval/cases"))
     parser.add_argument("--runs", type=int, default=3, help="runs per case, to check the results repeat")
     parser.add_argument("--out", type=Path, help="write the markdown report here instead of stdout")
+    parser.add_argument("--json", type=Path, help="also write the results as JSON here (schema in this module's docstring)")
     parser.add_argument("--model", help=f"extract through Ollama instead of regex; claimcheck.extract calls {extract.MODEL}")
     args = parser.parse_args(argv)
     if args.runs < 1:
@@ -455,6 +546,9 @@ def main(argv: list[str] | None = None) -> int:
     s = summarize(results)
     if unavailable:
         print(f"whole run skipped: {unavailable}", file=sys.stderr)
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(to_json(results, meta), indent=2) + "\n")
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text)
