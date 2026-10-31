@@ -47,7 +47,7 @@ def check_symbol(repo: Path, name: str) -> Evidence:
     if hits:
         path, line = hits[0]
         return Evidence(claim, Status.CONFIRMED, f"{name} is defined", f"{path.relative_to(repo)}:{line}")
-    return Evidence(claim, Status.REFUTED, f"{name} is not defined anywhere in the repo", str(repo.name))
+    return Evidence(claim, Status.REFUTED, f"{name} is not defined anywhere in the repo", repo.resolve().name)
 
 
 def changed_files(diff: str) -> list[str]:
