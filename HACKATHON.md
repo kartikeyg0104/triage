@@ -17,7 +17,7 @@
 
 **Problem 2: Triage that tests the claims.**
 
-A tool (a command-line tool today; a GitHub App is not built yet) that checks whether a bug report, security report or pull request claim is true, and shows maintainers the evidence. Claims are tested safely in an isolated sandbox with no secrets and no network. Examples of the evidence it produces: "reproduced on 2.4.1", "`parse_url_v2()` does not exist", "no test covers this change".
+A tool that checks whether a bug report, security report or pull request claim is true, and shows maintainers the evidence. It is a CLI, a GitHub Action that comments on PRs, and a small service with signed webhook ingestion; a full GitHub App installation flow is not built. Repros run with no secrets and no network, either as a local sandboxed process or as a locked-down Kubernetes Job (egress blocking verified by a probe pod before anything runs). Examples of the evidence it produces: "reproduced: fails on base, passes on the PR head", "`parse_url_v2()` does not appear in any source file", "no test file changed; existing tests may still cover it".
 
 ## Models
 
