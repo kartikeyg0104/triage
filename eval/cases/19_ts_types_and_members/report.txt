@@ -1,0 +1,3 @@
+describe() prints a `Circle` with the wrong unit when `ShapeOptions` asks for "em", and
+scaleBy() keeps the old radius, so area() never changes. `Kind` has no Triangle member, and
+perimeter() returns NaN for every shape.
