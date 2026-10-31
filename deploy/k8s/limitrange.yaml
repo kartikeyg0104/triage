@@ -1,0 +1,22 @@
+# Per-container bounds in namespace claimcheck. A container that names no resources gets exactly
+# what the executor's own containers ask for (defaultRequest 100m / 64Mi, default limit 500m / 256Mi),
+# so it is counted against the ResourceQuota (which requires every pod to have requests and limits).
+# max (1 CPU / 512Mi) is twice the executor's limits: no single container can take a large share of
+# the quota, and the executor's Job fits with room to spare.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: claimcheck-executor
+  namespace: claimcheck
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 64Mi
+      default:
+        cpu: 500m
+        memory: 256Mi
+      max:
+        cpu: "1"
+        memory: 512Mi
