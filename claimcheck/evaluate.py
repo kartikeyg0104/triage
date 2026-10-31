@@ -2,10 +2,11 @@
 
     python -m claimcheck.evaluate [--cases eval/cases] [--runs 3] [--out docs/EVALUATION.md]
     python -m claimcheck.evaluate --model gemma3:1b [--runs 3] [--out docs/EVALUATION_GEMMA.md]
+    python -m claimcheck.evaluate --executor kubernetes [--kube-context kind-claimcheck]
 
 A case is a tiny repo, a report, an optional PR diff and a case.json written from what is
 actually true about that repo. Each case goes through the real pipeline (regex extraction and
-the real local sandbox) and every claim and verdict is compared with the truth. Wrong confirmed
+the selected executor) and every claim and verdict is compared with the truth. Wrong confirmed
 and wrong refuted are the numbers that matter: an unverified answer costs a maintainer a look,
 a wrong definite answer misleads them.
 
@@ -19,6 +20,8 @@ and both are made from the same numbers). Schema version 1:
     schema_version   1; bumped when a field changes meaning or is removed
     generated        date, platform, python, revision, uncommitted (bool), isolation
     model            the --model name, or null for regex extraction
+    executor         name (local or kubernetes), context, namespace (null for local),
+                     egress_verified (bool, or null if no repro ran)
     skip_reason      why the whole run was skipped (Ollama unreachable), or null
     runs_per_case    --runs
     metrics          cases, scored, skipped, claims_total, claims_correct, verdicts_correct,
@@ -29,7 +32,7 @@ and both are made from the same numbers). Schema version 1:
     cases            [{name, skipped (reason or null), correct, repeatable, wrong_confirmed,
                      wrong_refuted, seconds, claims: [{key, expected, got (one per run), label,
                      correct}], overall: {expected, got, label, correct},
-                     runs: [{seconds, model, claims: {key: status}, overall}]}]
+                     runs: [{seconds, model, claims: {key: status}, overall, repro_source}]}]
 
 Labels are those of the markdown Per case table: ok, miss, wrong confirmed, wrong refuted.
 Seconds are wall-clock and rounded to milliseconds.
@@ -45,10 +48,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import cli, extract, sandbox
+from . import cli, extract, k8s, sandbox
 from .models import Claim, Evidence, Status, Verdict
 
 SKIP_NO_ISOLATION = "skipped (no sandbox isolation)"
@@ -62,6 +66,8 @@ ROOT = Path(__file__).resolve().parent.parent
 _STATUSES = tuple(s.value for s in Status)
 _CLAIM_KEY = re.compile(r"^(pr_tests|repro|symbol:[A-Za-z_][A-Za-z0-9_]*)$")
 _CASE_KEYS = {"truth", "repro", "expect", "expected"}
+_VERIFIED_EGRESS = re.compile(r"^kubernetes\[[^\]\n]+\] \(egress blocked, verified\): ")
+ReproRunner = Callable[[Path, str, str], Evidence]
 
 
 class CaseError(ValueError):
@@ -89,6 +95,7 @@ class Run:
     overall: str
     model: str | None = None  # the model run_check reports it used; None is regex extraction
     seconds: float = field(default=0.0, compare=False)  # wall-clock; not part of what the tool said
+    repro_source: str | None = field(default=None, compare=False)
 
     @property
     def names(self) -> list[str]:
@@ -257,24 +264,53 @@ def _claim_key(claim: Claim) -> str:
     return f"symbol:{claim.target}" if claim.kind == "symbol" else claim.kind
 
 
-def run_once(case: Case, use_model: bool = False) -> Run:
+def run_once(case: Case, use_model: bool = False, run_repro: ReproRunner | None = None) -> Run:
     start = time.perf_counter()
+    runner = run_repro if run_repro is not None else sandbox.run_repro
+
+    def guarded_repro(repo: Path, command: str, expect: str) -> Evidence:
+        try:
+            return runner(repo, command, expect)
+        except (OSError, subprocess.SubprocessError) as error:
+            claim = Claim("repro", f"`{command}` reproduces the reported failure", command)
+            return Evidence(claim, Status.UNVERIFIED, f"executor setup failure: {error}", "executor setup failure")
+
     verdict, model = cli.run_check(case.repo, case.report, case.diff, case.repro, case.expect, use_model=use_model,
-                                   run_repro=sandbox.run_repro)
+                                   run_repro=guarded_repro)
     seconds = _seconds(time.perf_counter() - start)  # rounded once, so every total adds up from what is shown
-    return Run({_claim_key(e.claim): e.status.value for e in verdict.evidence}, verdict.outcome, model, seconds)
+    source = next((e.source for e in verdict.evidence if e.claim.kind == "repro"), None)
+    return Run({_claim_key(e.claim): e.status.value for e in verdict.evidence}, verdict.outcome, model, seconds, source)
 
 
-def run_case(case: Case, runs: int, isolated: bool, use_model: bool = False) -> CaseResult:
+def run_case(case: Case, runs: int, isolated: bool, use_model: bool = False,
+             run_repro: ReproRunner | None = None) -> CaseResult:
     """Without isolation the tool rightly refuses to run a repro. Scoring that refusal against
     the truth would measure the machine, so the case is skipped instead."""
     if case.repro and not isolated:
         return CaseResult(case, [], SKIP_NO_ISOLATION)
-    return CaseResult(case, [run_once(case, use_model) for _ in range(runs)])
+    return CaseResult(case, [run_once(case, use_model, run_repro) for _ in range(runs)])
 
 
-def evaluate(cases: list[Case], runs: int, isolated: bool, use_model: bool = False) -> list[CaseResult]:
-    return [run_case(case, runs, isolated, use_model) for case in cases]
+def evaluate(cases: list[Case], runs: int, isolated: bool, use_model: bool = False,
+             run_repro: ReproRunner | None = None) -> list[CaseResult]:
+    return [run_case(case, runs, isolated, use_model, run_repro) for case in cases]
+
+
+def _egress_counts(results: list[CaseResult]) -> tuple[int, int]:
+    repro_runs = [run for result in results if result.case.repro for run in result.runs]
+    verified = sum(bool(_VERIFIED_EGRESS.match(run.repro_source or "")) for run in repro_runs)
+    return verified, len(repro_runs)
+
+
+def egress_verified(results: list[CaseResult]) -> bool | None:
+    """Only executor evidence of a successful probe verifies egress; no repro runs means n/a."""
+    verified, total = _egress_counts(results)
+    return verified == total if total else None
+
+
+def _executor_info(results: list[CaseResult], meta: dict[str, str]) -> dict:
+    return {"name": meta.get("executor", "local"), "context": meta.get("kube_context"),
+            "namespace": meta.get("k8s_namespace"), "egress_verified": egress_verified(results)}
 
 
 def ollama_unavailable(model: str, timeout: int = 5) -> str:
@@ -377,18 +413,29 @@ def _difference_lines(results: list[CaseResult]) -> list[str]:
 
 def to_markdown(results: list[CaseResult], meta: dict[str, str]) -> str:
     s, t = summarize(results), timing(results)
+    executor = _executor_info(results, meta)
     model = meta.get("model")
     model_skipped = any(r.skipped == SKIP_NO_MODEL for r in results)
     runs = meta["runs"] + (" run" if meta["runs"] == "1" else " runs")
     revision = f"`{meta['revision']}`" + (" with uncommitted changes" if meta.get("uncommitted") else "")
     command = "python -m claimcheck.evaluate" + (f" --model {model}" if model else "") + f" --runs {meta['runs']}"
+    if executor["name"] == "kubernetes":
+        command += " --executor kubernetes"
+        if executor["context"]:
+            command += f" --kube-context {executor['context']}"
+        command += f" --k8s-namespace {executor['namespace']}"
+        executor_name = f"kubernetes (context {executor['context'] or 'current'}, namespace {executor['namespace']})"
+        repro_pipeline = "Kubernetes (`claimcheck.k8s.KubernetesExecutor.run_repro`)"
+    else:
+        executor_name = "local sandbox"
+        repro_pipeline = "the local sandbox (`claimcheck.sandbox.run_repro`)"
+    verified, total = _egress_counts(results)
+    egress = f"{'yes' if executor['egress_verified'] else 'no'} ({verified}/{total} repro runs)" if total else "n/a (no repro runs)"
     if model:
         pipeline = (f"- Pipeline: `claimcheck.cli.run_check` with `use_model=True` ({model} extraction through "
-                    "`claimcheck.extract.extract_claims`, regex names merged in) and the local sandbox "
-                    "(`claimcheck.sandbox.run_repro`)")
+                    f"`claimcheck.extract.extract_claims`, regex names merged in) and {repro_pipeline}")
     else:
-        pipeline = ("- Pipeline: `claimcheck.cli.run_check` with `use_model=False` (regex extraction) and the local "
-                    "sandbox (`claimcheck.sandbox.run_repro`)")
+        pipeline = f"- Pipeline: `claimcheck.cli.run_check` with `use_model=False` (regex extraction) and {repro_pipeline}"
     lines = [
         "# claimcheck evaluation" + (f": {model} extraction" if model else ""),
         "",
@@ -398,6 +445,8 @@ def to_markdown(results: list[CaseResult], meta: dict[str, str]) -> str:
         f"- Machine: {meta['platform']}, Python {meta['python']}",
         f"- Git revision: {revision}",
         f"- Sandbox: {meta['isolation']}",
+        f"- Executor: {executor_name}",
+        f"- Egress verified: {egress}",
         f"- Cases: {s.cases} ({s.scored} scored, {s.skipped} skipped), {runs} each",
         pipeline,
         f"- Wall-clock: {t['total_seconds']:.3f}s over {_plural(t['runs'], 'run')} (sum of per-run times)",
@@ -471,7 +520,8 @@ def _case_json(r: CaseResult) -> dict:
         "seconds": r.seconds,
         "claims": [] if r.skipped else [{"key": key, **_answer(r.expected(key), r.got(key))} for key in r.claim_keys()],
         "overall": None if r.skipped else _answer(r.case.overall, [run.overall for run in r.runs]),
-        "runs": [{"seconds": run.seconds, "model": run.model, "claims": run.claims, "overall": run.overall}
+        "runs": [{"seconds": run.seconds, "model": run.model, "claims": run.claims, "overall": run.overall,
+                  "repro_source": run.repro_source}
                  for run in r.runs],
     }
 
@@ -485,6 +535,7 @@ def to_json(results: list[CaseResult], meta: dict[str, str]) -> dict:
         "generated": {key: meta.get(key, "") for key in ("date", "platform", "python", "revision", "isolation")}
                      | {"uncommitted": bool(meta.get("uncommitted"))},
         "model": meta.get("model"),
+        "executor": _executor_info(results, meta),
         "skip_reason": meta.get("skip_reason"),
         "runs_per_case": int(meta["runs"]),
         "metrics": metrics | {"scored": s.scored},
@@ -522,6 +573,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, help="write the markdown report here instead of stdout")
     parser.add_argument("--json", type=Path, help="also write the results as JSON here (schema in this module's docstring)")
     parser.add_argument("--model", help=f"extract through Ollama instead of regex; claimcheck.extract calls {extract.MODEL}")
+    parser.add_argument("--executor", choices=["local", "kubernetes"], default="local",
+                        help="where repros run: the local sandbox or Kubernetes Jobs")
+    parser.add_argument("--kube-context", help="kubectl context to use")
+    parser.add_argument("--k8s-namespace", default="claimcheck", help="namespace for Kubernetes Jobs")
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
@@ -532,8 +587,16 @@ def main(argv: list[str] | None = None) -> int:
     except CaseError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
-    isolation = sandbox.detect_isolation()
+    isolation = sandbox.detect_isolation() if args.executor == "local" else None
     meta = machine_info(args.runs, isolation)
+    meta["executor"] = args.executor
+    run_repro = sandbox.run_repro
+    if args.executor == "kubernetes":
+        run_repro = k8s.KubernetesExecutor(namespace=args.k8s_namespace, context=args.kube_context).run_repro
+        meta["isolation"] = "kubernetes"
+        meta["k8s_namespace"] = args.k8s_namespace
+        if args.kube_context:
+            meta["kube_context"] = args.kube_context
     unavailable = ollama_unavailable(args.model) if args.model else ""
     if args.model:
         meta["model"] = args.model
@@ -541,7 +604,8 @@ def main(argv: list[str] | None = None) -> int:
         meta["skip_reason"] = unavailable
         results = [CaseResult(case, [], SKIP_NO_MODEL) for case in cases]
     else:
-        results = evaluate(cases, args.runs, isolation is not None, use_model=args.model is not None)
+        results = evaluate(cases, args.runs, args.executor == "kubernetes" or isolation is not None,
+                           use_model=args.model is not None, run_repro=run_repro)
     text = to_markdown(results, meta)
     s = summarize(results)
     if unavailable:
