@@ -208,3 +208,71 @@ def test_describe_skipped_counts_kinds(layout):
     if hasattr(os, "mkfifo"):
         assert "1 special file" in note
     assert repo_copy.describe_skipped([]) == ""
+
+
+def test_defaults_are_sensible():
+    assert repo_copy.MAX_TOTAL_BYTES == 200 * 1024 * 1024
+    assert repo_copy.MAX_FILES == 20_000
+    assert repo_copy.MAX_FILE_BYTES == 50 * 1024 * 1024
+
+
+def test_normal_repo_is_unaffected_by_the_caps(layout):
+    repo, _, dst = layout
+    assert repo_copy.copy_repo(repo, dst, max_total_bytes=4, max_files=3, max_file_bytes=2) == []
+    assert (dst / "a.txt").read_text() == "a\n"
+    assert (dst / "sub" / "b.txt").read_text() == "b\n"
+
+
+def test_file_over_the_per_file_limit_is_skipped_and_reported(layout):
+    repo, _, dst = layout
+    (repo / "sub" / "big.bin").write_bytes(b"x" * 100)
+    skipped = repo_copy.copy_repo(repo, dst, max_file_bytes=10)
+    assert not os.path.lexists(dst / "sub" / "big.bin")
+    assert (dst / "a.txt").read_text() == "a\n"
+    assert [(e.path, e.kind) for e in skipped] == [(os.path.join("sub", "big.bin"), repo_copy.LARGE_FILE)]
+    assert "1 file over the per-file size limit was not copied" in repo_copy.describe_skipped(skipped)
+
+
+def test_skipped_large_files_do_not_count_toward_the_total(layout):
+    repo, _, dst = layout
+    (repo / "big.bin").write_bytes(b"x" * 100)
+    skipped = repo_copy.copy_repo(repo, dst, max_total_bytes=10, max_file_bytes=10)
+    assert [e.kind for e in skipped] == [repo_copy.LARGE_FILE]
+
+
+def test_total_bytes_cap_stops_the_copy_and_removes_the_partial_copy(layout):
+    repo, _, dst = layout
+    (repo / "c.txt").write_bytes(b"c" * 8)
+    with pytest.raises(repo_copy.RepoTooLarge) as caught:
+        repo_copy.copy_repo(repo, dst, max_total_bytes=9)
+    assert "repo too large to copy safely" in str(caught.value)
+    assert not os.path.lexists(dst)
+
+
+def test_file_count_cap_stops_the_copy_and_removes_the_partial_copy(layout):
+    repo, _, dst = layout
+    for i in range(5):
+        (repo / f"f{i}.txt").write_text("")
+    with pytest.raises(repo_copy.RepoTooLarge) as caught:
+        repo_copy.copy_repo(repo, dst, max_files=4)
+    assert "repo too large to copy safely" in str(caught.value)
+    assert not os.path.lexists(dst)
+
+
+def test_caps_are_read_from_module_defaults_at_call_time(layout, monkeypatch):
+    repo, _, dst = layout
+    monkeypatch.setattr(repo_copy, "MAX_FILES", 1)
+    with pytest.raises(repo_copy.RepoTooLarge):
+        repo_copy.copy_repo(repo, dst)
+
+
+def test_sandbox_reports_a_too_large_repo_as_unverified_without_running(layout, monkeypatch):
+    from claimcheck import sandbox
+    from claimcheck.models import Status
+    repo, _, _ = layout
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("fake", []))
+    monkeypatch.setattr(repo_copy, "MAX_FILES", 1)
+    evidence = sandbox.run_repro(repo, "touch ran; exit 1", "")
+    assert evidence.status is Status.UNVERIFIED
+    assert "repo too large to copy safely" in evidence.detail
+    assert not (repo / "ran").exists()
