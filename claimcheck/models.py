@@ -32,6 +32,7 @@ class Evidence:
 class Verdict:
     evidence: list[Evidence] = field(default_factory=list)
     revision: str = ""  # git commit of the repo that was tested, if it is a git checkout
+    report_truncated: bool = False  # the model saw only the first part of the report; the rest was regex-only
 
     @property
     def outcome(self) -> str:
