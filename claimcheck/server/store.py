@@ -105,6 +105,15 @@ class Store:
             row = conn.execute(f"SELECT {COLUMNS} FROM investigations WHERE id = ?", (investigation_id,)).fetchone()
         return _row(row) if row else None
 
+    def list(self, status: str | None = None, limit: int = 50, offset: int = 0) -> list[Investigation]:
+        """Investigations newest first (insertion order breaks ties), optionally only one status."""
+        where, params = ("WHERE status = ?", (status,)) if status is not None else ("", ())
+        with self._connect() as conn:
+            found = conn.execute(f"SELECT {COLUMNS} FROM investigations {where} "
+                                 "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+                                 params + (limit, offset)).fetchall()
+        return [_row(row) for row in found]
+
     def claim(self, worker: str, stale_after: float, max_attempts: int = 3,
               now: float | None = None) -> Investigation | None:
         """Mark the oldest `received` row (or a `processing` row whose worker has held it for over
