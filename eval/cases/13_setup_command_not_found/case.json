@@ -1,0 +1,9 @@
+{
+  "truth": "parse_url is defined at repo/urls.py:1. repro.sh calls urlfuzz, which is neither in the repo nor a standard command, so the shell exits 127 and parse_url never runs. The expected text does appear in the output, but only because the script echoes it first. Nothing was reproduced.",
+  "repro": "sh repro.sh",
+  "expect": "Segmentation fault in parse_url",
+  "expected": {
+    "claims": {"symbol:parse_url": "confirmed", "repro": "unverified"},
+    "overall": "unverified"
+  }
+}

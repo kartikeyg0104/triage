@@ -1,0 +1,2 @@
+Security: validate_token() still accepts expired tokens, so a stolen session never
+stops working.

@@ -1,0 +1,7 @@
+{
+  "truth": "validate_token does not exist in this code. It is not defined statically, not created at runtime, and not imported. Its only trace is the comment at repo/auth.py:3 saying it was removed. The report is about a function that is gone, so the claim is false.",
+  "expected": {
+    "claims": {"symbol:validate_token": "refuted"},
+    "overall": "refuted"
+  }
+}

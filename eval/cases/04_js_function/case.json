@@ -1,0 +1,7 @@
+{
+  "truth": "slugify is a function declaration at repo/src/slug.js:1 and truncateSlug a const arrow function at repo/src/slug.js:5. Both exist.",
+  "expected": {
+    "claims": {"symbol:slugify": "confirmed", "symbol:truncateSlug": "confirmed"},
+    "overall": "supported"
+  }
+}

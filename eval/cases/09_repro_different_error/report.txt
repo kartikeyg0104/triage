@@ -1,0 +1,2 @@
+load_config() loses the port setting when the file has more than one entry.
+`python3 poc.py` raises "KeyError: 'port'".

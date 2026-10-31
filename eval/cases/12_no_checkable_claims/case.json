@@ -1,0 +1,7 @@
+{
+  "truth": "The report names no function or class and gives no command or diff. 'Feels slow' could be true or false, and nothing in the report can be checked against the repo.",
+  "expected": {
+    "claims": {},
+    "overall": "unverified"
+  }
+}
