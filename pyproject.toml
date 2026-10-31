@@ -12,10 +12,11 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+server = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 
 [project.scripts]
 claimcheck = "claimcheck.cli:main"
 
 [tool.setuptools]
-packages = ["claimcheck"]
+packages = ["claimcheck", "claimcheck.server"]
