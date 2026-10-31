@@ -124,16 +124,20 @@ def build_job(name: str, image: str, command: str, timeout: int, runtime_class: 
 class KubernetesExecutor:
     def __init__(self, namespace: str = "claimcheck", image: str = "python:3.12-slim", runtime_class: str | None = None,
                  context: str | None = None, deadline: int | None = None, poll_interval: float = 2.0,
-                 require_network_isolation: bool = True, run=subprocess.run):
+                 require_network_isolation: bool = True, impersonate: str | None = None, run=subprocess.run):
+        """`impersonate` runs every kubectl call as that user (`kubectl --as`), for example
+        `system:serviceaccount:claimcheck:claimcheck-executor` from deploy/k8s."""
         self.namespace, self.image, self.runtime_class = namespace, image, runtime_class
         self.context, self.deadline, self.poll_interval, self._run = context, deadline, poll_interval, run
-        self.require_network_isolation = require_network_isolation
+        self.require_network_isolation, self.impersonate = require_network_isolation, impersonate
         self._isolated: bool | None = None
 
     def _kubectl(self, verb: str, *args: str, input: str | None = None) -> subprocess.CompletedProcess:
         command = ["kubectl", verb, *args, "-n", self.namespace]
         if self.context:
             command += ["--context", self.context]
+        if self.impersonate:
+            command += ["--as", self.impersonate]
         return self._run(command, input=input, capture_output=True, text=True, timeout=120)
 
     def _pod_state(self, name: str) -> dict:
