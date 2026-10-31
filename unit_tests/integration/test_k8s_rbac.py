@@ -11,6 +11,7 @@ Run with CLAIMCHECK_K8S_CONTEXT=<kubectl context> (CI uses a kind cluster). Skip
 import json
 import os
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +20,8 @@ import pytest
 
 from claimcheck import k8s
 from claimcheck.models import Status
+
+from ._runs import RecordingRun, left_behind
 
 CONTEXT = os.environ.get("CLAIMCHECK_K8S_CONTEXT")
 NAMESPACE = "claimcheck"
@@ -62,14 +65,45 @@ def executor(namespace=NAMESPACE, **kw):
 # --- the executor works as the ServiceAccount -----------------------------------------------
 
 
-def test_full_run_as_the_service_account(tmp_path):
-    (tmp_path / "poc.py").write_text("raise RuntimeError('buffer overflow in parse_url')\n")
-    evidence = executor().run_repro(tmp_path, "python3 poc.py", "buffer overflow in parse_url", timeout=90)
+def full_run(repo, recorder):
+    (repo / "poc.py").write_text("raise RuntimeError('buffer overflow in parse_url')\n")
+    evidence = executor(run=recorder).run_repro(repo, "python3 poc.py", "buffer overflow in parse_url", timeout=90)
     assert "egress blocked, verified" in evidence.source, evidence.detail  # the probe ran too
     assert evidence.status is Status.CONFIRMED, evidence.detail
     assert evidence.source.startswith(f"kubernetes[{NAMESPACE}/")
-    left = kubectl("get", "jobs,configmaps,networkpolicies", "-n", NAMESPACE, "-l", k8s.RUN_LABEL, "-o", "name")
-    assert left.stdout.strip() == "", left.stdout
+    assert len(recorder.names) == 2, recorder.names  # the network probe, then the repro
+    return evidence
+
+
+def test_full_run_as_the_service_account(tmp_path):
+    # Only this run's objects: the namespace is shared, other runs and leftovers may be there (#63).
+    recorder = RecordingRun()
+    full_run(tmp_path, recorder)
+    assert left_behind(kubectl, NAMESPACE, recorder.names) == []
+
+
+def test_two_concurrent_runs_both_pass_and_both_clean_up(tmp_path):
+    recorders, errors = [RecordingRun(), RecordingRun()], []
+
+    def one(i):
+        try:
+            repo = tmp_path / f"run{i}"
+            repo.mkdir()
+            full_run(repo, recorders[i])
+        except BaseException as error:  # noqa: BLE001 - re-raised below, in the test's thread
+            errors.append(error)
+
+    threads = [threading.Thread(target=one, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    assert not any(thread.is_alive() for thread in threads), "a run did not finish"
+    if errors:
+        raise errors[0]
+    names = recorders[0].names + recorders[1].names
+    assert len(set(names)) == 4, names  # distinct runs, nothing shared
+    assert left_behind(kubectl, NAMESPACE, names) == []
 
 
 def test_service_account_cannot_run_in_default(tmp_path):
