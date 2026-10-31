@@ -180,7 +180,7 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
 
 
 _LIMIT_SIGNALS = {signal.SIGXCPU: "CPU time, SIGXCPU", signal.SIGXFSZ: "file size, SIGXFSZ", signal.SIGKILL: "SIGKILL"}
-_LIMIT_MARKERS = ("Resource temporarily unavailable", "MemoryError", "Cannot allocate memory", "std::bad_alloc",
+_LIMIT_MARKERS = ("Resource temporarily unavailable", "Cannot fork", "MemoryError", "Cannot allocate memory", "std::bad_alloc",
                   "File too large", "Too many open files", "Cputime limit exceeded", "Filesize limit exceeded")
 
 
