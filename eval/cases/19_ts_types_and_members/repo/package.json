@@ -1,0 +1,5 @@
+{
+  "name": "tiny-shapes",
+  "version": "1.0.0",
+  "main": "src/shapes.ts"
+}
