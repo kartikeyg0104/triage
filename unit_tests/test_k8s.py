@@ -2,6 +2,8 @@
 
 import io
 import json
+import os
+import posixpath
 import subprocess
 import tarfile
 from pathlib import Path
@@ -90,16 +92,91 @@ def test_network_policy_denies_all_traffic_for_the_run():
     assert "ingress" not in policy["spec"] and "egress" not in policy["spec"]
 
 
-def test_pack_repo_skips_git_and_vendored_dirs(repo):
-    data = k8s.pack_repo(repo)
+def members(data: bytes) -> dict[str, tarfile.TarInfo]:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-        names = tar.getnames()
+        return {m.name: m for m in tar.getmembers()}
+
+
+def test_pack_repo_skips_git_and_vendored_dirs(repo):
+    (repo / "venv").mkdir()
+    (repo / "venv" / "pyvenv.cfg").write_text("x")
+    data, skipped = k8s.pack_repo(repo)
+    names = list(members(data))
     assert "repo/poc.py" in names
-    assert not [n for n in names if ".git" in n or "node_modules" in n]
+    assert not [n for n in names if ".git" in n or "node_modules" in n or "venv" in n]
+    assert skipped == []
+
+
+@pytest.fixture
+def linky(tmp_path):
+    """A repo next to a secret, with links that stay inside, links that escape, and a FIFO."""
+    root = tmp_path / "repo"
+    (root / "sub").mkdir(parents=True)
+    (root / "poc.py").write_text("print('hi')\n")
+    (root / "run.sh").write_text("#!/bin/sh\n")
+    (root / "run.sh").chmod(0o755)
+    (tmp_path / "secret.txt").write_text("host secret\n")
+    (root / "leak").symlink_to("/etc/hostname")  # absolute: inside the pod it would read the pod's file
+    (root / "up").symlink_to("../secret.txt")  # escapes the repo dir
+    (root / "sub" / "deep_up").symlink_to("../../secret.txt")
+    (root / "alias").symlink_to("poc.py")  # inside, relative
+    (root / "abs_inside").symlink_to(root / "poc.py")  # inside, but absolute on this machine
+    (root / "sub" / "back").symlink_to("../poc.py")  # inside, through ..
+    os.mkfifo(root / "pipe")
+    return root
+
+
+def escapes(member: tarfile.TarInfo) -> bool:
+    """Would this link, unpacked under repo/, point at or above repo/'s parent?"""
+    landed = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), member.linkname))
+    return posixpath.isabs(member.linkname) or not landed.startswith("repo/")
+
+
+def test_pack_repo_never_stores_a_link_that_points_outside_the_repo(linky):
+    data, _ = k8s.pack_repo(linky)
+    links = {name: m.linkname for name, m in members(data).items() if m.issym() or m.islnk()}
+    assert not [name for name, target in links.items() if posixpath.isabs(target)], links
+    assert not [name for name, m in members(data).items() if (m.issym() or m.islnk()) and escapes(m)], links
+    assert not {"repo/leak", "repo/up", "repo/sub/deep_up"} & set(links), links
+
+
+def test_pack_repo_keeps_inside_links_as_relative_links(linky):
+    entries = members(k8s.pack_repo(linky)[0])
+    assert entries["repo/alias"].issym() and entries["repo/alias"].linkname == "poc.py"
+    assert entries["repo/abs_inside"].issym() and entries["repo/abs_inside"].linkname == "poc.py"
+    assert entries["repo/sub/back"].issym() and entries["repo/sub/back"].linkname == "../poc.py"
+
+
+def test_pack_repo_stores_files_as_regular_files_and_skips_fifos(linky):
+    data, skipped = k8s.pack_repo(linky)
+    entries = members(data)
+    assert "repo/pipe" not in entries
+    assert not [m.name for m in entries.values() if not (m.isreg() or m.isdir() or m.issym())]
+    assert entries["repo"].isdir() and entries["repo/sub"].isdir()
+    poc = entries["repo/poc.py"]
+    assert poc.isreg() and poc.size == len("print('hi')\n") and (poc.uid, poc.gid, poc.uname) == (0, 0, "")
+    assert entries["repo/run.sh"].mode & 0o100  # the executable bit survives
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        assert tar.extractfile("repo/poc.py").read() == b"print('hi')\n"
+    assert sorted((d.path, d.kind) for d in skipped) == [
+        ("leak", "outside-link"), ("pipe", "special"), ("sub/deep_up", "outside-link"), ("up", "outside-link")]
+
+
+def test_dropped_links_and_special_files_are_noted_in_the_evidence(linky):
+    fake = FakeKubectl(exit_code=1, logs="RuntimeError: boom")
+    evidence = executor(fake).run_repro(linky, "python3 poc.py", "boom")
+    assert evidence.status is Status.CONFIRMED
+    assert "3 symlinks pointing outside the repo were not copied" in evidence.detail
+    assert "1 special file (FIFO, socket or device) was skipped" in evidence.detail
+
+
+def test_no_note_when_nothing_was_left_out(repo):
+    evidence = executor(FakeKubectl(exit_code=1, logs="RuntimeError: boom")).run_repro(repo, "python3 poc.py", "boom")
+    assert "note:" not in evidence.detail
 
 
 def test_configmap_carries_the_tarball_and_is_size_capped(repo):
-    cm = k8s.build_configmap("run-1", k8s.pack_repo(repo))
+    cm = k8s.build_configmap("run-1", k8s.pack_repo(repo)[0])
     assert "repo.tgz" in cm["binaryData"]
     with pytest.raises(k8s.RepoTooLarge):
         k8s.build_configmap("run-1", b"x" * (k8s.MAX_REPO_BYTES + 1))
@@ -107,7 +184,7 @@ def test_configmap_carries_the_tarball_and_is_size_capped(repo):
 
 def test_all_objects_carry_the_run_label(repo):
     for obj in (k8s.build_job("run-1", "img", "true", timeout=5), k8s.build_network_policy("run-1"),
-                k8s.build_configmap("run-1", k8s.pack_repo(repo))):
+                k8s.build_configmap("run-1", k8s.pack_repo(repo)[0])):
         assert obj["metadata"]["labels"][k8s.RUN_LABEL] == "run-1"
 
 
