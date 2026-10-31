@@ -23,7 +23,31 @@ curl -s localhost:8080/v1/investigations -H 'Content-Type: application/json' \
   -d '{"repo": "sample_repo", "report": "RCE in parse_url_v2()"}'
 ```
 
-Everything is stored in one SQLite file (table `investigations`), so results survive a restart.
+Everything is stored in one SQLite file (table `investigations`), so results survive a restart. A file from an older version gets the new columns (`error`, `worker`, `claimed_at`, `attempts`) when it is opened.
+
+## Worker
+
+Webhook events are checked by a separate process that shares the SQLite file:
+
+```bash
+echo '{"octo/widgets": "widgets"}' > repos.json   # GitHub repo -> checkout under --repo-root
+python -m claimcheck.server.worker --db claimcheck.db --repo-root /srv/checkouts --repos repos.json
+```
+
+It claims the oldest `received` row, runs the same static checks as `POST /v1/investigations` on the issue or PR title and body (regex extractor, no model, no repro, no diff), stores the result and logs one JSON line (`{"id", "status", "worker"}`) per row. From Python: `claimcheck.server.worker.process_one(store, root, repos, worker_id)` handles one row, `run(...)` loops.
+
+| Status | Meaning |
+|---|---|
+| `processing` | Claimed by the worker named in `worker` |
+| `completed` | `result` holds the same JSON as `--json` |
+| `skipped` | The repo is not in `--repos`; `error` says which. Nothing was read |
+| `failed` | The check raised, the event had no repo or text, or the checkout no longer resolves inside `--repo-root`; `error` says why |
+
+Options: `--once` (exit when the queue is empty, e.g. from cron), `--poll` (seconds between polls, default 2), `--stale-after` (default 600), `--worker-id` (default `host:pid`). `SIGTERM` or `SIGINT` finish the current row, then exit `0`.
+
+- **Concurrency.** Any number of workers can share the file. A row is claimed in one `BEGIN IMMEDIATE` transaction (select the oldest, mark it `processing` with the worker id), so two workers never get the same row. Tested with two worker processes racing over 320 rows: every row was handled exactly once.
+- **Crashed workers.** A `processing` row older than `--stale-after` seconds is claimed again by the next worker. A result is stored only while the worker still holds the claim, so a slow worker whose row was taken over cannot overwrite the newer attempt. After 3 claims that never finished, the row is `failed` (`abandoned after 3 attempts`) so one event cannot crash workers forever.
+- **Repo map.** Every path must resolve (`..` and symlinks) to a directory inside `--repo-root`, or the worker refuses to start (exit `2`). Paths are checked again before each check. Repo names match case-insensitively.
 
 ## Webhook responses
 
@@ -40,12 +64,14 @@ Everything is stored in one SQLite file (table `investigations`), so results sur
 - The signature is an HMAC-SHA256 of the raw body, checked with `hmac.compare_digest` before the body is parsed. An empty secret never verifies, because anyone can compute an HMAC with an empty key.
 - Request bodies are limited to 1 MiB (`413`). The limit is checked against `Content-Length` and against the bytes actually read, so chunked uploads are capped too.
 - `repo` is resolved (`..` and symlinks) and must be a directory inside `--repo-root`; anything else is `400`. A request with a `repro` field is rejected (`422`), not silently ignored.
-- Webhooks are only recorded. Nothing is fetched from GitHub and nothing is executed; the issue or PR text is stored as data.
+- Webhooks are only recorded by the server. The worker reads the recorded text only as data for the regex extractor: it never runs a repro or a command from it. Nothing is fetched from GitHub.
 - The investigations API has **no authentication**. Keep it on localhost, or put it behind a proxy that authenticates. It reads files under `--repo-root` (static analysis only), and stored investigations include the report and event text, which is untrusted.
 - The secret is read from the environment, not a flag, so it does not appear in the process list.
 
 ## Limits
 
-- Webhook events are recorded but not yet checked: there is no worker that clones the repo and runs the checks.
+- The worker checks a checkout that is already on disk, at whatever revision it is: it does not clone, fetch or check out the event's commit, and a PR is checked without its diff. Keeping the checkouts current is up to you.
+- `--stale-after` must be longer than the slowest check, or a row still in progress is claimed and checked a second time (only one result is kept). Stale detection uses each host's clock, so workers on several hosts sharing a network file need synced clocks; SQLite over a network filesystem is not recommended anyway.
+- Rows are polled, not pushed: a new event waits up to `--poll` seconds.
 - No GitHub App authentication (installation tokens, JWT) yet, and no posting of results back to GitHub.
 - Checks run inside the request, so a very large repo makes `POST /v1/investigations` slow.
