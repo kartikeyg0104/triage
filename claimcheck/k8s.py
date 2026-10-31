@@ -13,6 +13,10 @@ cluster really has it; the report names the runtime that was asked for.
 
 If RBAC refuses a kubectl call (the identity lacks a permission), the run stops and is reported as
 an RBAC setup failure naming the refused verb and resource, never as a network problem or a verdict.
+
+ResourceQuota and LimitRange admission denials are setup failures too. Job FailedCreate events
+are checked while waiting for a pod; this needs permission to list events. Without that permission,
+pod polling still works, but a controller admission denial may only be reported as a timeout.
 """
 
 import base64
@@ -106,6 +110,24 @@ class RBACDenied(Exception):
     def __init__(self, denials: list[Denial]):
         super().__init__(describe_denials(denials))
         self.denials = denials
+
+
+class AdmissionDenied(Exception):
+    """Keep admission's constraint and quota name, rather than guessing why no pod exists."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+
+def admission_denial(message: str) -> AdmissionDenied | None:
+    """Recognize admission's quota and LimitRange messages, not every Forbidden response."""
+    if re.search(r'\b(?:exceeded|failed) quota:\s*[\w.-]+', message):
+        return AdmissionDenied("ResourceQuota", message.strip())
+    if re.search(r'\b(?:maximum|minimum) \S+ usage per (?:Container|Pod|PersistentVolumeClaim) is\b'
+                 r'|\b\S+ max limit to request ratio per (?:Container|Pod) is\b', message):
+        return AdmissionDenied("LimitRange", message.strip())
+    return None
 
 
 def _meta(name: str) -> dict:
@@ -205,7 +227,7 @@ class KubernetesExecutor:
         self.context, self.deadline, self.poll_interval, self._run = context, deadline, poll_interval, run
         self.require_network_isolation, self.impersonate = require_network_isolation, impersonate
         self._isolated: bool | None = None
-        self._probe_denied: RBACDenied | None = None
+        self._probe_denied: RBACDenied | AdmissionDenied | None = None
 
     def _kubectl(self, verb: str, *args: str, input: str | None = None) -> subprocess.CompletedProcess:
         command = ["kubectl", verb, *args, "-n", self.namespace]
@@ -216,10 +238,13 @@ class KubernetesExecutor:
         return self._run(command, input=input, capture_output=True, text=True, timeout=120)
 
     def _kubectl_or_denied(self, verb: str, *args: str, input: str | None = None) -> subprocess.CompletedProcess:
-        """Like _kubectl, but an RBAC refusal raises instead of looking like an empty answer."""
+        """Setup refusals raise instead of looking like an empty answer."""
         done = self._kubectl(verb, *args, input=input)
-        if done.returncode != 0 and (denials := rbac_denials(done.stderr or "")):
-            raise RBACDenied(denials)
+        if done.returncode != 0:
+            if denials := rbac_denials(done.stderr or ""):
+                raise RBACDenied(denials)
+            if denial := admission_denial(done.stderr or ""):
+                raise denial
         return done
 
     def _pod_state(self, name: str) -> dict:
@@ -231,16 +256,28 @@ class KubernetesExecutor:
                 return status.get("state", {})
         return {}
 
+    def _check_admission_events(self, name: str) -> None:
+        """The Job controller can be refused a pod even when applying the Job succeeded."""
+        done = self._kubectl("get", "events", "--field-selector",
+                             f"involvedObject.kind=Job,involvedObject.name={name},reason=FailedCreate", "-o", "json")
+        if done.returncode != 0:
+            return  # event access is optional; the shipped Role permits only pod polling
+        for event in json.loads(done.stdout or "{}").get("items", []):
+            obj = event.get("involvedObject", {})
+            if obj.get("kind") == "Job" and obj.get("name") == name and event.get("reason") == "FailedCreate":
+                if denial := admission_denial(event.get("message", "")):
+                    raise denial
+
     def network_isolated(self) -> bool:
-        """Run the probe pod once under a deny-all policy. Cached for this executor, RBAC refusals too."""
+        """Run the probe once under a deny-all policy. Setup refusals are cached too."""
         if self._isolated is None and self._probe_denied is None:
             with tempfile.TemporaryDirectory(prefix="claimcheck-probe-") as probe_dir:
                 Path(probe_dir, "probe.py").write_text(PROBE_SCRIPT)
                 claim = Claim("network", "the cluster blocks pod egress")
                 try:
                     result = self._run_pod(Path(probe_dir), "python3 probe.py", PROBE_OK, 60, claim, "network probe")
-                except RBACDenied as error:
-                    self._probe_denied = error  # egress stays unknown: RBAC, not the network, stopped the probe
+                except (RBACDenied, AdmissionDenied) as error:
+                    self._probe_denied = error  # a setup refusal leaves egress unknown
                     return False
             self._isolated = result.status is Status.CONFIRMED
         return bool(self._isolated)
@@ -255,11 +292,18 @@ class KubernetesExecutor:
                         f"Grant the missing permissions in the executor's Role (deploy/k8s) or run as an identity that has them",
                         self._source(command))
 
+    def _admission_failure(self, claim: Claim, error: AdmissionDenied, stage: str, command: str) -> Evidence:
+        return Evidence(claim, Status.UNVERIFIED,
+                        f"{error.category} setup failure during the {stage}, so nothing was verified: {error}",
+                        self._source(command))
+
     def run_repro(self, repo: Path, command: str, expect: str, timeout: int = 30) -> Evidence:
         claim = Claim("repro", f"`{command}` reproduces the reported failure", command)
         if self.require_network_isolation and not self.network_isolated():
-            if self._probe_denied is not None:
+            if isinstance(self._probe_denied, RBACDenied):
                 return self._rbac_failure(claim, self._probe_denied, "network probe (the repro was not run)", command)
+            if isinstance(self._probe_denied, AdmissionDenied):
+                return self._admission_failure(claim, self._probe_denied, "network probe (the repro was not run)", command)
             return Evidence(claim, Status.UNVERIFIED,
                             "refused to run: this cluster does not enforce NetworkPolicy (a probe pod under a deny-all "
                             "policy could reach the network or could not run), so the pod would not be isolated",
@@ -268,9 +312,11 @@ class KubernetesExecutor:
             return self._run_pod(repo, command, expect, timeout, claim, self._source(command))
         except RBACDenied as error:
             return self._rbac_failure(claim, error, "repro", command)
+        except AdmissionDenied as error:
+            return self._admission_failure(claim, error, "repro", command)
 
     def _run_pod(self, repo: Path, command: str, expect: str, timeout: int, claim: Claim, source: str) -> Evidence:
-        """Raises RBACDenied if the identity may not run it; a refused cleanup is noted in the detail."""
+        """Setup refusals raise; cleanup still runs and any refused deletion is noted."""
         name = f"claimcheck-{uuid.uuid4().hex[:10]}"
         tarball, skipped = pack_repo(repo)
         left_out = describe_skipped(skipped)  # said in the evidence, so a run without them is not taken for a full one
@@ -282,24 +328,27 @@ class KubernetesExecutor:
         objects = {"apiVersion": "v1", "kind": "List",
                    "items": [configmap, build_network_policy(name),
                              build_job(name, self.image, command, timeout, self.runtime_class)]}
-        denied: RBACDenied | None = None
+        denied: RBACDenied | AdmissionDenied | None = None
         try:
             evidence = self._execute(name, objects, claim, expect, timeout, source)
-        except RBACDenied as error:
+        except (RBACDenied, AdmissionDenied) as error:
             denied = error
         finally:
             cleanup = self._kubectl("delete", "jobs,configmaps,networkpolicies", "-l", f"{RUN_LABEL}={name}",
                                     "--ignore-not-found", "--wait=true")
         left = rbac_denials(cleanup.stderr or "") if cleanup.returncode != 0 else []
-        if denied is not None:
+        if isinstance(denied, RBACDenied):
             raise RBACDenied(denied.denials + [d for d in left if d not in denied.denials])
+        note = ""
         if left:
             note = (f"; cleanup was forbidden by RBAC ({describe_denials(left)}), so this run's objects "
                     f"(label {RUN_LABEL}={name}) may be left behind")
-            evidence = dataclasses.replace(evidence, detail=evidence.detail + note)
+        if isinstance(denied, AdmissionDenied):
+            raise AdmissionDenied(denied.category, str(denied) + note)
+        evidence = dataclasses.replace(evidence, detail=evidence.detail + note)
         return _with_note(evidence, left_out)
 
-    def _execute(self, name, objects, claim, expect, timeout, source) -> Evidence:
+    def _execute(self, name: str, objects: dict, claim: Claim, expect: str, timeout: int, source: str) -> Evidence:
         applied = self._kubectl_or_denied("apply", "-f", "-", input=json.dumps(objects))
         if applied.returncode != 0:
             return Evidence(claim, Status.UNVERIFIED, f"setup failure: could not create the Job: {applied.stderr.strip()}", source)
@@ -312,6 +361,8 @@ class KubernetesExecutor:
             if reason in _FATAL_WAITING:
                 message = state["waiting"].get("message", "")
                 return Evidence(claim, Status.UNVERIFIED, f"setup failure: pod could not start ({reason}) {message}".strip(), source)
+            if not state:
+                self._check_admission_events(name)
             if time.monotonic() >= end:
                 return Evidence(claim, Status.UNVERIFIED, f"the pod did not finish in time (last state: {state or 'not created'})", source)
             time.sleep(self.poll_interval)
