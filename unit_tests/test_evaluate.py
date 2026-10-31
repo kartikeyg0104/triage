@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -12,12 +13,7 @@ CASE_NAMES = sorted(p.name for p in CASES.iterdir() if p.is_dir()) if CASES.is_d
 
 # Cases the tool gets wrong today. Only misses that leave a claim unverified may be listed here:
 # a wrong confirmed or wrong refuted answer must fail.
-KNOWN_MISSES = {
-    "04_js_function": "the regex extractor treats a backticked lowerCamelCase name (`truncateSlug`) as prose, so that "
-                      "claim is never checked; the verdict is right only because the name happens to exist",
-    "14_symbol_removed_but_mentioned": "the removed function's name survives in a comment; any mention is treated as "
-                                       "a possible dynamic definition, so a false claim comes back unverified, not refuted",
-}
+KNOWN_MISSES: dict[str, str] = {}
 
 
 def case(claims, overall, repro=None, name="c"):
@@ -266,6 +262,15 @@ def test_no_case_gets_a_wrong_confirmed_or_wrong_refuted(real_results):
 
 def test_real_cases_are_repeatable(real_results):
     assert [r.case.name for r in real_results if not r.repeatable] == []
+
+
+def test_real_cases_are_right_from_under_a_build_directory(tmp_path):
+    """Where a checkout lives must not change what is found in it. Repro cases are skipped: they
+    test the sandbox, not the static search."""
+    moved = tmp_path / "build" / "cases"
+    shutil.copytree(CASES, moved)
+    results = evaluate.evaluate(evaluate.load_cases(moved), runs=1, isolated=False)
+    assert [r.case.name for r in results if not r.skipped and r.case.name not in KNOWN_MISSES and not r.correct] == []
 
 
 @pytest.mark.parametrize("name", [

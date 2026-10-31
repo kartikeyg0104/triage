@@ -65,3 +65,13 @@ def test_model_misses_are_filled_in_by_regex():
 def test_plain_backticked_words_are_not_symbols():
     result = extract.regex_extract("Set `path` and `repro`, then call `parse_url` and `Router` and `go()`.")
     assert {c.target for c in result.claims} == {"parse_url", "Router", "go"}
+
+
+def test_backticked_lower_camel_case_names_are_symbols():
+    result = extract.regex_extract("`truncateSlug` and `truncateSlg` break; `path`, `URL` and `slug` are prose.")
+    assert [c.target for c in result.claims] == ["truncateSlug", "truncateSlg"]
+
+
+def test_model_path_also_adds_a_lower_camel_case_name_the_model_missed():
+    result = extract.extract_claims("A crafted slug overflows `truncateSlg`.", fake({"symbols": []}))
+    assert [c.target for c in result.claims] == ["truncateSlg"]
