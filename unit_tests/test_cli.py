@@ -100,6 +100,98 @@ def test_kubernetes_executor_is_used_with_its_settings(repo, tmp_path, monkeypat
                      "--expect", "boom", "--executor", "kubernetes", "--k8s-namespace", "ns",
                      "--k8s-runtime-class", "gvisor", "--kube-context", "kind-x"])
     assert code == 0
-    assert seen["init"] == {"namespace": "ns", "image": "python:3.12-slim", "runtime_class": "gvisor", "context": "kind-x"}
+    assert seen["init"] == {"namespace": "ns", "image": "python:3.12-slim", "runtime_class": "gvisor", "context": "kind-x",
+                            "impersonate": None}
     assert seen["run"] == ("python3 poc.py", "boom")
     assert "kubernetes[ns/gvisor]" in capsys.readouterr().out
+
+
+EXECUTOR_SA = "system:serviceaccount:claimcheck:claimcheck-executor"
+
+
+def kubernetes_check(repo, tmp_path, *extra):
+    rep = write(tmp_path, "r.txt", "crash in `parse_url()`")
+    return ["check", "--repo", str(repo), "--report", rep, "--no-model", "--repro", "python3 poc.py",
+            "--expect", "boom", "--executor", "kubernetes", *extra]
+
+
+def fake_kubectl(calls, stderr_for=None):
+    """A kubectl that records its arguments; `stderr_for` maps a verb to a failure."""
+    import subprocess
+
+    def run(args, input=None, capture_output=True, text=True, timeout=None):
+        calls.append(args)
+        verb = args[1]
+        if stderr_for and verb in stderr_for:
+            return subprocess.CompletedProcess(args, 1, "", stderr_for[verb])
+        if verb == "get":
+            state = {"terminated": {"exitCode": 1}}
+            return subprocess.CompletedProcess(args, 0, json.dumps({"items": [{"status": {"containerStatuses": [{"state": state}]}}]}), "")
+        logs = "CLAIMCHECK-EGRESS-BLOCKED" if sum(a[1] == "logs" for a in calls) == 1 else "boom"
+        return subprocess.CompletedProcess(args, 0, logs if verb == "logs" else "", "")
+    return run
+
+
+def use_fake_kubectl(monkeypatch, run):
+    from claimcheck import k8s
+    real = k8s.KubernetesExecutor
+    monkeypatch.setattr(k8s, "KubernetesExecutor", lambda **kw: real(**kw, run=run, poll_interval=0))
+
+
+def test_k8s_impersonate_runs_every_kubectl_call_as_that_identity(repo, tmp_path, monkeypatch, capsys):
+    calls = []
+    use_fake_kubectl(monkeypatch, fake_kubectl(calls))
+    code = cli.main(kubernetes_check(repo, tmp_path, "--k8s-impersonate", EXECUTOR_SA, "--json"))
+    out = json.loads(capsys.readouterr().out)
+    assert code == 0, out
+    assert out["evidence"][-1]["status"] == "confirmed"
+    assert {args[1] for args in calls} >= {"apply", "get", "logs", "delete"}
+    assert all(args[args.index("--as") + 1] == EXECUTOR_SA for args in calls)
+
+
+def test_without_k8s_impersonate_kubectl_runs_as_the_caller(repo, tmp_path, monkeypatch, capsys):
+    calls = []
+    use_fake_kubectl(monkeypatch, fake_kubectl(calls))
+    assert cli.main(kubernetes_check(repo, tmp_path)) == 0
+    assert calls and not [args for args in calls if "--as" in args]
+
+
+def test_rbac_denial_is_reported_as_an_unverified_rbac_setup_failure(repo, tmp_path, monkeypatch, capsys):
+    denied = "system:serviceaccount:claimcheck:default"
+    stderr = (f'Error from server (Forbidden): error when retrieving current configuration of: ... configmaps '
+              f'"claimcheck-1" is forbidden: User "{denied}" cannot get resource "configmaps" in API group "" in the '
+              'namespace "claimcheck"')
+    calls = []
+    use_fake_kubectl(monkeypatch, fake_kubectl(calls, {"apply": stderr}))
+    code = cli.main(kubernetes_check(repo, tmp_path, "--k8s-impersonate", denied, "--json"))
+    out = json.loads(capsys.readouterr().out)
+    assert code == 2 and out["verdict"] == "unverified"
+    repro = out["evidence"][-1]
+    assert repro["status"] == "unverified"
+    assert "RBAC setup failure" in repro["detail"]
+    assert f'User "{denied}" cannot get configmaps' in repro["detail"]
+    assert "NetworkPolicy" not in repro["detail"]
+
+
+def test_k8s_impersonate_is_in_the_help():
+    assert "--k8s-impersonate" in cli.build_parser()._subparsers._group_actions[0].choices["check"].format_help()
+
+
+def test_sarif_flag_writes_the_file_and_keeps_stdout_and_exit_code(repo, tmp_path, capsys):
+    rep = write(tmp_path, "r.txt", "RCE in parse_url_v2()")
+    out_path = tmp_path / "out" / "claimcheck.sarif"
+    out_path.parent.mkdir()
+    code = cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model", "--sarif", str(out_path)])
+    assert code == 1
+    assert "**Verdict: refuted**" in capsys.readouterr().out
+    data = json.loads(out_path.read_text())
+    assert data["version"] == "2.1.0"
+    result = data["runs"][0]["results"][0]
+    assert result["ruleId"] == "claimcheck/symbol" and result["level"] == "error"
+    assert "parse_url_v2" in result["message"]["text"]
+
+
+def test_without_sarif_flag_no_file_is_written(repo, tmp_path):
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    assert cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model"]) == 0
+    assert not list(tmp_path.rglob("*.sarif"))
