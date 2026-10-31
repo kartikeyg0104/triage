@@ -1,0 +1,2 @@
+Fix: round_cents() truncated instead of rounding (2.675 became 2.67). This PR
+rounds half up and adds a regression test.

@@ -1,0 +1,1 @@
+render_table() is broken for some inputs. See `python3 poc.py`.

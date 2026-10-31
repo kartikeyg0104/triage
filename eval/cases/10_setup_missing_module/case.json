@@ -1,0 +1,9 @@
+{
+  "truth": "parse_url is defined at repo/urls.py:1. poc.py imports urlfuzz, which is not in the repo or installed, so it stops with ModuleNotFoundError before parse_url is called. The run says nothing about the reported MemoryError either way.",
+  "repro": "python3 poc.py",
+  "expect": "MemoryError",
+  "expected": {
+    "claims": {"symbol:parse_url": "confirmed", "repro": "unverified"},
+    "overall": "unverified"
+  }
+}

@@ -1,0 +1,2 @@
+The app feels slow on my laptop since the last update. It used to start
+instantly. Please look into it.

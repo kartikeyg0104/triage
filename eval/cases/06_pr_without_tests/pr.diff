@@ -1,0 +1,9 @@
+diff --git a/money.py b/money.py
+--- a/money.py
++++ b/money.py
+@@ -6,4 +6,4 @@ def parse_amount(text):
+     >>> parse_amount("7")
+     7.0
+     """
+-    return float(text.replace(",", ""))
++    return float(text.translate({ord(","): None}))

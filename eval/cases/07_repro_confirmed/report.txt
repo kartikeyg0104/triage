@@ -1,0 +1,2 @@
+average_latency() crashes when no samples were collected. Run `python3 poc.py`
+and it fails with "ZeroDivisionError: division by zero".

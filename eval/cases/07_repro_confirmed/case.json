@@ -1,0 +1,9 @@
+{
+  "truth": "average_latency is defined at repo/stats.py:1 and divides by len(samples) without a guard. poc.py calls it with an empty list, which raises ZeroDivisionError: division by zero and exits 1. The bug is real and the repro shows it.",
+  "repro": "python3 poc.py",
+  "expect": "ZeroDivisionError: division by zero",
+  "expected": {
+    "claims": {"symbol:average_latency": "confirmed", "repro": "confirmed"},
+    "overall": "supported"
+  }
+}
