@@ -1,3 +1,5 @@
+import os
+import signal
 import socket
 import threading
 
@@ -159,3 +161,100 @@ def test_setup_failures_are_never_confirmed_or_refuted(code, output):
     evidence = sandbox.classify(CLAIM, code, output + " buffer overflow", "buffer overflow", "src")
     assert evidence.status is Status.UNVERIFIED
     assert "setup or environment failure" in evidence.detail
+
+
+# Resource limits (issue #49). Each test lowers one ceiling so it trips quickly and cheaply.
+
+@needs_isolation
+def test_cpu_spinner_is_stopped_by_a_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox.LIMITS, "cpu_seconds", 1)
+    (tmp_path / "spin.py").write_text("while True:\n    pass\n")
+    evidence = sandbox.run_repro(tmp_path, "python3 spin.py", "", timeout=8)
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "timed out" not in evidence.detail
+
+
+@needs_isolation
+def test_huge_file_write_is_stopped_by_a_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox.LIMITS, "file_bytes", 8 << 20)
+    (tmp_path / "fill.py").write_text(
+        "with open('big.bin', 'wb') as f:\n    for _ in range(64):\n        f.write(b'x' * (1 << 20))\n"
+        "print('WROTE ALL')\nraise SystemExit(1)\n"
+    )
+    evidence = sandbox.run_repro(tmp_path, "python3 fill.py", "WROTE ALL")
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "WROTE ALL" not in evidence.detail
+
+
+@needs_isolation
+def test_memory_hog_is_stopped_where_the_os_enforces_it(tmp_path, monkeypatch):
+    enforced, reason = sandbox.memory_limit_enforced()
+    if not enforced:
+        pytest.skip(f"memory limit not enforced here: {reason}")
+    monkeypatch.setitem(sandbox.LIMITS, "memory_bytes", 512 << 20)
+    (tmp_path / "hog.py").write_text("b = bytearray(2 << 30)\nprint('ALLOCATED')\nraise SystemExit(1)\n")
+    evidence = sandbox.run_repro(tmp_path, "python3 hog.py", "ALLOCATED")
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "ALLOCATED" not in evidence.detail
+
+
+@needs_isolation
+def test_unenforced_memory_limit_is_recorded_when_a_run_is_stopped(tmp_path, monkeypatch):
+    enforced, reason = sandbox.memory_limit_enforced()
+    if enforced:
+        pytest.skip("the OS enforces the memory limit, nothing to record")
+    monkeypatch.setitem(sandbox.LIMITS, "cpu_seconds", 1)
+    (tmp_path / "spin.py").write_text("while True:\n    pass\n")
+    stopped = sandbox.run_repro(tmp_path, "python3 spin.py", "", timeout=8)
+    timed_out = sandbox.run_repro(tmp_path, "sleep 5", "", timeout=1)
+    assert "memory limit not enforced" in stopped.detail
+    assert "memory limit not enforced" in timed_out.detail
+
+
+@needs_isolation
+@pytest.mark.skipif(os.geteuid() == 0, reason="the process limit does not apply to root")
+def test_bounded_fork_loop_is_stopped_by_a_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox.LIMITS, "extra_processes", 32)
+    (tmp_path / "forks.py").write_text(
+        "import os, sys, time\n"
+        "for _ in range(300):\n"
+        "    try:\n        pid = os.fork()\n"
+        "    except OSError as e:\n        print('FORK FAILED', e)\n        sys.exit(1)\n"
+        "    if pid == 0:\n        os.close(0); os.close(1); os.close(2)\n        time.sleep(3)\n        os._exit(0)\n"
+        "print('FORKED ALL')\nsys.exit(1)\n"
+    )
+    evidence = sandbox.run_repro(tmp_path, "python3 forks.py", "FORK FAILED")
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "FORKED ALL" not in evidence.detail
+
+
+@needs_isolation
+def test_normal_repro_still_confirms_under_default_limits(repo):
+    evidence = sandbox.run_repro(repo, "for i in 1 2 3; do python3 ok.py; done; python3 boom.py", "crash on long url")
+    assert evidence.status is Status.CONFIRMED
+    assert "resource limit" not in evidence.detail
+
+
+@pytest.mark.parametrize("code,output", [
+    (-signal.SIGXCPU, ""),
+    (128 + signal.SIGXCPU, ""),
+    (-signal.SIGXFSZ, ""),
+    (128 + signal.SIGXFSZ, ""),
+    (-signal.SIGKILL, ""),
+    (137, ""),
+    (1, "BlockingIOError: [Errno 35] Resource temporarily unavailable"),
+    (1, "sh: fork: Resource temporarily unavailable"),
+    (1, "Traceback ... MemoryError"),
+    (0, "MemoryError caught, carrying on"),
+])
+def test_limit_hits_are_recognised(code, output):
+    assert sandbox.limit_hit(code, output)
+
+
+@pytest.mark.parametrize("code,output", [(1, "KeyError: x"), (0, "fine"), (2, "usage: poc")])
+def test_ordinary_failures_are_not_limit_hits(code, output):
+    assert sandbox.limit_hit(code, output) is None
