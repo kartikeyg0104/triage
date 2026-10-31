@@ -1,10 +1,25 @@
 import json
 import re
+import shutil
+import ssl
+import subprocess
+import threading
 import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
 
 from claimcheck import extract
 
 REPORT = "RCE in parse_url_v2(). Run `python poc.py` and you get 'SegmentationFault'. Also see `Router`."
+
+
+@pytest.fixture(autouse=True)
+def _no_model_settings_from_the_environment(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    monkeypatch.delenv("CLAIMCHECK_MODEL", raising=False)
 
 
 def fake(payload):
@@ -219,3 +234,238 @@ def test_regex_path_is_unaffected_by_the_hardening():
     fallback = extract.extract_claims(report, lambda p: "not json")
     assert {c.target for c in fallback.claims} == {"parse_url", "late_name"}
     assert fallback.model is None
+
+
+# Issue #78: the Ollama host and the model come from settings, not constants.
+
+@contextmanager
+def fake_ollama(payload, known=("gemma3:1b",), answer_as=None, reply=None, status=200, tls_context=None):
+    """A stdlib HTTP server on 127.0.0.1 that speaks enough of Ollama's /api/generate.
+    Models not in `known` get Ollama's 404 "model not found" error. Yields (base_url, requests)."""
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append({"path": self.path, "body": body})
+            if body["model"] in known:
+                code = status
+                response = reply if reply is not None else {
+                    "model": answer_as or body["model"], "response": json.dumps(payload), "done": True}
+            else:
+                code, response = 404, {"error": f'model "{body["model"]}" not found, try pulling it first'}
+            data = json.dumps(response).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    if tls_context is not None:
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        scheme = "https" if tls_context is not None else "http"
+        yield f"{scheme}://127.0.0.1:{server.server_address[1]}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+ROUTER = {"symbols": ["Router"]}
+
+
+def test_default_model_and_host_are_unchanged():
+    assert extract.MODEL == "gemma3:1b"
+    assert extract.DEFAULT_HOST == "http://localhost:11434"
+    assert extract.OLLAMA_URL == "http://localhost:11434/api/generate"
+    assert extract.ollama_base_url(None) == extract.DEFAULT_HOST
+    assert extract.model_name() == "gemma3:1b"
+
+
+def test_ollama_host_as_host_port_is_used(monkeypatch):
+    with fake_ollama(ROUTER) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base.removeprefix("http://"))
+        result = extract.extract_claims(REPORT)
+    assert [r["path"] for r in requests] == ["/api/generate"]
+    assert requests[0]["body"]["model"] == "gemma3:1b"
+    assert result.model == "gemma3:1b"
+    assert "Router" in {c.target for c in result.claims}
+
+
+def test_ollama_host_as_full_url_and_claimcheck_model_are_used(monkeypatch):
+    with fake_ollama(ROUTER, known=("qwen3:0.6b",)) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base + "/")
+        monkeypatch.setenv("CLAIMCHECK_MODEL", "qwen3:0.6b")
+        result = extract.extract_claims(REPORT)
+    assert [(r["path"], r["body"]["model"]) for r in requests] == [("/api/generate", "qwen3:0.6b")]
+    assert result.model == "qwen3:0.6b"
+    assert result.note == ""
+
+
+def test_model_argument_overrides_claimcheck_model(monkeypatch):
+    monkeypatch.setenv("CLAIMCHECK_MODEL", "from-env:1b")
+    assert extract.model_name("from-flag:2b") == "from-flag:2b"
+    assert extract.model_name() == "from-env:1b"
+    with fake_ollama(ROUTER, known=("from-flag:2b",)) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        result = extract.extract_claims(REPORT, model="from-flag:2b")
+    assert [r["body"]["model"] for r in requests] == ["from-flag:2b"]
+    assert result.model == "from-flag:2b"
+
+
+def test_extraction_names_the_model_that_answered(monkeypatch):
+    # Ollama says which model produced the reply; that name, not the requested one, goes in the result.
+    with fake_ollama(ROUTER, known=("gemma3",), answer_as="gemma3:latest") as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        result = extract.extract_claims(REPORT, model="gemma3")
+    assert result.model == "gemma3:latest"
+
+
+def test_fake_generate_still_reports_the_configured_model(monkeypatch):
+    monkeypatch.setenv("CLAIMCHECK_MODEL", "qwen3:0.6b")
+    assert extract.extract_claims(REPORT, fake(ROUTER)).model == "qwen3:0.6b"
+
+
+def test_unknown_model_falls_back_to_regex_and_says_so(monkeypatch, capsys):
+    with fake_ollama(ROUTER) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        result = extract.extract_claims(REPORT, model="nosuch:7b")
+    assert [r["body"]["model"] for r in requests] == ["nosuch:7b"]
+    assert result.model is None
+    assert {c.target for c in result.claims} == {"parse_url_v2", "Router"}
+    assert "nosuch:7b" in result.note and "not found" in result.note and "regex" in result.note
+    assert "nosuch:7b" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("", "http://localhost:11434"),
+    ("  ", "http://localhost:11434"),
+    ("127.0.0.1:9999", "http://127.0.0.1:9999"),
+    ("ollama.internal", "http://ollama.internal:11434"),
+    ("0.0.0.0", "http://0.0.0.0:11434"),
+    ("http://ollama.internal:8080", "http://ollama.internal:8080"),
+    ("http://ollama.internal:8080/", "http://ollama.internal:8080"),
+    ("http://ollama.internal", "http://ollama.internal:80"),
+    ("https://ollama.example.com", "https://ollama.example.com:443"),
+    ("HTTPS://ollama.example.com:8443", "https://ollama.example.com:8443"),
+    ("https://proxy.example.com/ollama", "https://proxy.example.com:443/ollama"),
+    ("[::1]:11434", "http://[::1]:11434"),
+])
+def test_ollama_host_values_are_read_like_ollama_does(value, expected):
+    assert extract.ollama_base_url(value) == expected
+
+
+@pytest.mark.parametrize("value", [
+    "file:///etc/passwd", "file:/etc/passwd", "ftp://ollama.internal:21", "gopher://h:70", "javascript:alert(1)",
+    "http://", "https://:443", "not a host", "host:notaport", "host:0", "host:70000", "http://user@host:1",
+    "http://host:1?x=1", "http://host:1#frag", "http://ho\nst:1",
+])
+def test_ollama_host_that_is_not_http_or_https_is_rejected(value):
+    with pytest.raises(extract.InvalidOllamaHost) as error:
+        extract.ollama_base_url(value)
+    assert "OLLAMA_HOST" in str(error.value) and "http" in str(error.value)
+
+
+def test_invalid_ollama_host_falls_back_to_regex_without_a_request(monkeypatch, capsys):
+    with fake_ollama(ROUTER) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", "file:///etc/passwd")
+        result = extract.extract_claims(REPORT)
+    assert requests == []
+    assert result.model is None
+    assert {c.target for c in result.claims} == {"parse_url_v2", "Router"}
+    assert "OLLAMA_HOST" in result.note and "file:///etc/passwd" in result.note and "regex" in result.note
+    assert "OLLAMA_HOST" in capsys.readouterr().err
+
+
+def test_unreachable_host_falls_back_with_a_note(monkeypatch):
+    with fake_ollama(ROUTER) as (base, requests):
+        pass  # the server is gone after this block: nothing listens on that port any more
+    monkeypatch.setenv("OLLAMA_HOST", base)
+    result = extract.extract_claims(REPORT)
+    assert result.model is None
+    assert base in result.note and "regex" in result.note
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("::1", "http://[::1]:11434"),
+    ("2001:db8::1", "http://[2001:db8::1]:11434"),
+    (":11435", "http://localhost:11435"),
+])
+def test_ollama_host_accepts_ip_and_port_only_settings(value, expected):
+    assert extract.ollama_base_url(value) == expected
+
+
+@pytest.mark.parametrize("value", ["http://[1]:11434", "http://[:::]:11434"])
+def test_invalid_ipv6_host_is_rejected(value):
+    with pytest.raises(extract.InvalidOllamaHost):
+        extract.ollama_base_url(value)
+
+
+def test_host_path_prefix_is_used(monkeypatch):
+    with fake_ollama(ROUTER) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base + "/ollama/")
+        result = extract.extract_claims(REPORT)
+    assert [r["path"] for r in requests] == ["/ollama/api/generate"]
+    assert result.model == "gemma3:1b"
+
+
+@pytest.mark.parametrize("value", ["", "  "])
+def test_empty_model_setting_uses_default_with_fake_server(monkeypatch, value):
+    with fake_ollama(ROUTER) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        monkeypatch.setenv("CLAIMCHECK_MODEL", value)
+        result = extract.extract_claims(REPORT)
+    assert requests[0]["body"]["model"] == "gemma3:1b"
+    assert result.model == "gemma3:1b"
+
+
+@pytest.mark.parametrize("model", [None, "", "  ", 123, ["gemma3:1b"]])
+def test_reply_without_valid_model_identity_falls_back(monkeypatch, model):
+    reply = {"response": json.dumps(ROUTER)}
+    if model is not None:
+        reply["model"] = model
+    with fake_ollama(ROUTER, reply=reply) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        result = extract.extract_claims(REPORT)
+    assert len(requests) == 1
+    assert result.model is None
+    assert {c.target for c in result.claims} == {"parse_url_v2", "Router"}
+    assert "model" in result.note and "regex" in result.note
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_server_error_preserves_the_reason_in_fallback(monkeypatch, status):
+    with fake_ollama(ROUTER, reply={"error": "model loading failed"}, status=status) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        result = extract.extract_claims(REPORT)
+    assert len(requests) == 1
+    assert result.model is None
+    assert "model loading failed" in result.note and base in result.note and "regex" in result.note
+
+
+def test_https_host_uses_a_tls_fake_server(monkeypatch, tmp_path):
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is needed to create the fake server's test certificate")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run([openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert, key)
+    client_context = ssl.create_default_context(cafile=str(cert))
+    monkeypatch.setattr(ssl, "_create_default_https_context", lambda: client_context)
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    with fake_ollama(ROUTER, tls_context=server_context) as (base, requests):
+        monkeypatch.setenv("OLLAMA_HOST", base)
+        result = extract.extract_claims(REPORT)
+    assert base.startswith("https://")
+    assert result.model == "gemma3:1b", result.note
+    assert [r["path"] for r in requests] == ["/api/generate"]
