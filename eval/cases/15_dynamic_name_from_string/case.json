@@ -1,0 +1,7 @@
+{
+  "truth": "export_tsv exists at runtime: the loop at repo/exporters.py:15 runs on import and calls setattr(sys.modules[__name__], 'export_' + _fmt, ...) for 'csv' and 'tsv', so `import exporters; exporters.export_tsv` works. The full name is never written anywhere (it is built from 'export_' + 'tsv') and it has no def or class statement, so a static search cannot see it. The honest answer is unverified. Refuted would be false.",
+  "expected": {
+    "claims": {"symbol:export_tsv": "unverified"},
+    "overall": "unverified"
+  }
+}

@@ -73,8 +73,9 @@ def parse_model_output(raw: str, report: str) -> Extraction | None:
 
 
 def _looks_like_code(name: str) -> bool:
-    """A backticked plain word like `path` is prose; `parse_url` and `Router` look like code."""
-    return "_" in name or (name[0].isupper() and any(c.islower() for c in name))
+    """A backticked plain word like `path` (or `URL`) is prose; `parse_url`, `Router` and
+    `truncateSlug` look like code."""
+    return "_" in name or not (name.islower() or name.isupper())
 
 
 def regex_extract(report: str) -> Extraction:
