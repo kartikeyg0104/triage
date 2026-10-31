@@ -1,6 +1,7 @@
 """Command line: claimcheck check --repo PATH --report FILE [--diff FILE] [--repro CMD --expect TEXT]."""
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -8,9 +9,17 @@ from . import checks, extract, report, sandbox
 from .models import Verdict
 
 
+def git_revision(repo: Path) -> str:
+    try:
+        done = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
 def run_check(repo: Path, report_text: str, diff: str | None, repro: str | None, expect: str, use_model: bool):
     extraction = extract.extract_claims(report_text) if use_model else extract.regex_extract(report_text)
-    verdict = Verdict()
+    verdict = Verdict(revision=git_revision(repo))
     for claim in extraction.claims:
         verdict.evidence.append(checks.check_symbol(repo, claim.target))
     if diff is not None:

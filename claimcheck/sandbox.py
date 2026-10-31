@@ -62,10 +62,27 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
         except subprocess.TimeoutExpired:
             return Evidence(claim, Status.UNVERIFIED, f"timed out after {timeout}s", f"{name}: {command}")
     output = (proc.stdout + proc.stderr).replace(str(target.resolve()), "<repo>").replace(str(target), "<repo>").strip()
-    source = f"{name}: {command}"
-    if proc.returncode != 0 and expect in output:
-        return Evidence(claim, Status.CONFIRMED, f"reproduced: exit {proc.returncode}; {_tail(output)}", source)
-    return Evidence(claim, Status.REFUTED, f"not reproduced: exit {proc.returncode}; {_tail(output)}", source)
+    return classify(claim, proc.returncode, output, expect, f"{name}: {command}")
+
+
+_SETUP_MARKERS = ("command not found", "ModuleNotFoundError", "ImportError", "Cannot find module",
+                  "No such file or directory", "Permission denied", "not recognized as")
+
+
+def classify(claim: Claim, returncode: int, output: str, expect: str, source: str) -> Evidence:
+    """A non-zero exit alone proves nothing: the command may simply be broken here."""
+    shown = _tail(output)
+    if returncode in (126, 127) or any(marker in output for marker in _SETUP_MARKERS):
+        return Evidence(claim, Status.UNVERIFIED, f"setup or environment failure, not a reproduction: exit {returncode}; {shown}", source, "observed")
+    if returncode == 0:
+        return Evidence(claim, Status.REFUTED, f"not reproduced: the command succeeded (exit 0); {shown}", source, "observed")
+    if not expect:
+        return Evidence(claim, Status.UNVERIFIED,
+                        f"the command failed (exit {returncode}) but no expected failure text was given, so this does not show the reported bug; {shown}",
+                        source, "observed")
+    if expect in output:
+        return Evidence(claim, Status.CONFIRMED, f"reproduced: exit {returncode} and the output contains the expected text; {shown}", source, "observed")
+    return Evidence(claim, Status.UNVERIFIED, f"the command failed (exit {returncode}) with a different message than expected; {shown}", source, "observed")
 
 
 def _tail(text: str, limit: int = 200) -> str:

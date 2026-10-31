@@ -36,6 +36,14 @@ Add `--json` for JSON output, or `--no-model` to skip Gemma and use the regex ex
 - **PR tests:** does the diff change source files without touching any test file?
 - **Repro:** runs the given command in a throwaway copy of the repo with the network denied and a clean environment. If the machine has no way to block the network (`sandbox-exec` on macOS, `unshare -rn` on Linux), the command is **not run** and the claim stays unverified.
 
+## How to read the evidence
+
+Each row says whether it was **observed** (we saw it: a definition at `file:line`, a test file in the diff, the expected failure text in the output) or **inferred** (we concluded it from absence or a heuristic). The report also names the git revision that was tested.
+
+- A function found nowhere in the source is *refuted* (inferred). If the name appears but has no static definition, it is *unverified*, because it may be defined at runtime.
+- A PR that changes no test file is *unverified*, not refuted: existing tests may already cover it. Coverage is not measured.
+- A repro is *confirmed* only if the command fails **and** prints the expected text. A failure with no expected text, or a different message, is *unverified*. Exit 0 is *refuted*. Setup failures (command not found, missing module or file, exit 126/127) are *unverified* and never count as a reproduction.
+
 ## Models
 
 `gemma3:1b` through Ollama reads the report and lists the names and repro command in it. Names the model returns that are not in the report are dropped, and names written as `name()` are always added, so a small model cannot hide a claim. If Ollama is not running, the regex extractor is used and the report says so. There are no cloud AI calls.
