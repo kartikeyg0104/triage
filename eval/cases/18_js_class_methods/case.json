@@ -1,0 +1,14 @@
+{
+  "truth": "In repo/src/cart.js, fromJSON is a static method (line 15) and addItem a method whose default parameter contains a call (line 23) of class Cart, and formatPrice is a method shorthand in the module.exports object (line 37); node shows all three are functions. isAllowed is never defined: it is a constructor parameter stored on the instance (line 12) and called as this.isAllowed(item) (line 24), so whether it is a function depends on what the caller passes (new Cart() leaves it undefined); unverified. clearCart exists only in the doc comment (lines 4-7), which also shows its old definition, so it does not exist (node: undefined on the module and the prototype). removeItem appears nowhere. Two names do not exist, so the report is refuted.",
+  "expected": {
+    "claims": {
+      "symbol:addItem": "confirmed",
+      "symbol:fromJSON": "confirmed",
+      "symbol:formatPrice": "confirmed",
+      "symbol:isAllowed": "unverified",
+      "symbol:clearCart": "refuted",
+      "symbol:removeItem": "refuted"
+    },
+    "overall": "refuted"
+  }
+}
