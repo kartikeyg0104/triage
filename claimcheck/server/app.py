@@ -9,12 +9,13 @@ import json
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from .. import report
 from ..cli import run_check
-from . import dashboard, webhook
+from . import auth, dashboard, webhook
 from .paths import inside_root
 from .store import Store
 
@@ -54,10 +55,31 @@ def resolve_repo(root: Path, relative: str) -> Path:
     return path
 
 
-def create_app(db_path: Path, repo_root: Path, webhook_secret: str, max_body: int = MAX_BODY) -> FastAPI:
+def unauthorized(kind: str):
+    challenge = {"WWW-Authenticate": "Bearer"}
+    message = "missing or invalid bearer token (Authorization: Bearer <CLAIMCHECK_API_TOKEN>)"
+    if kind == "dashboard":
+        response = dashboard.error_page(401, "Unauthorized", message)
+        response.headers.update(challenge)
+        return response
+    return JSONResponse({"detail": message}, status_code=401, headers=challenge)
+
+
+def create_app(db_path: Path, repo_root: Path, webhook_secret: str, max_body: int = MAX_BODY,
+               api_token: str = "") -> FastAPI:
+    """With `api_token`, the investigations API and the dashboard need `Authorization: Bearer <api_token>`.
+    Without it they are open: the entry point only allows that on a loopback host."""
     app = FastAPI(title="claimcheck")
     store = Store(db_path)
     root = repo_root.resolve()
+
+    if api_token:
+        @app.middleware("http")
+        async def require_token(request: Request, call_next):
+            kind = auth.protected(request.scope["path"])  # the decoded path the router matches
+            if kind and not auth.authorized(request, api_token):
+                return unauthorized(kind)
+            return await call_next(request)
 
     @app.post("/v1/investigations", status_code=201)
     async def create_investigation(request: Request) -> dict:
