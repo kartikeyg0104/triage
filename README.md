@@ -127,6 +127,10 @@ CI runs the unit tests and local integration tests on every PR, builds a kind cl
 - The service's webhook records events but no worker processes them yet, and there is no GitHub App installation flow.
 - The evaluation cases are small and written by the team; Gemma extraction is not evaluated.
 
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and PR rules, and [SECURITY.md](SECURITY.md) to report a vulnerability privately.
+
 License: MIT.
 
 ## Issue forms

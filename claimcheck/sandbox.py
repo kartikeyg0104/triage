@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .models import Claim, Evidence, Status
-from .repo_copy import copy_repo, describe_skipped
+from .repo_copy import RepoTooLarge, copy_repo, describe_skipped
 
 _MAC_PROFILE = "(version 1)(allow default)(deny network*)"
 
@@ -51,7 +51,10 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
     name, prefix = isolation
     with tempfile.TemporaryDirectory(prefix="claimcheck-") as work:
         target = Path(work) / "repo"
-        note = describe_skipped(copy_repo(repo, target))
+        try:
+            note = describe_skipped(copy_repo(repo, target))
+        except RepoTooLarge as exc:
+            return Evidence(claim, Status.UNVERIFIED, str(exc), "sandbox")
         try:
             proc = subprocess.run(
                 prefix + ["sh", "-c", command],
