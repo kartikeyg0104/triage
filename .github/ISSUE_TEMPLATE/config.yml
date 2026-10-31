@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/kartikeyg0104/triage/security/advisories/new
+    about: Use private vulnerability reporting for anything security-sensitive that is not yet public.
