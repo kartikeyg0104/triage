@@ -1,0 +1,11 @@
+{
+  "truth": "page_count is defined at repo/paging/pages.py:1 and page_slice at repo/paging/pages.py:8. The repo is the pre-PR state: page_count returns total // per_page, so 11 items at 10 per page give 1 page. The diff applies cleanly (patch -p1), changes paging/pages.py to round up, edits CHANGELOG.md and adds tests/test_pages.py; those tests fail on the repo as it is (2 of 5) and pass with the diff applied. The PR does change tests alongside its source change.",
+  "expected": {
+    "claims": {
+      "symbol:page_count": "confirmed",
+      "symbol:page_slice": "confirmed",
+      "pr_tests": "confirmed"
+    },
+    "overall": "supported"
+  }
+}

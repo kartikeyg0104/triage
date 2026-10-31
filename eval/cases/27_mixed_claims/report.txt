@@ -1,0 +1,7 @@
+Several problems with user/workspace handles:
+
+1. normalize_handle() lower-cases only the user, so "Alice/TEAM" and "alice/team"
+   become distinct accounts. `python3 poc.py` fails with "AssertionError: alice/TEAM".
+2. `AccountRecord` stores that partially normalized handle.
+3. strip_suffix() runs after normalizing, so "alice+news/team" keeps its suffix.
+4. send_welcome() runs twice when a record is created.
