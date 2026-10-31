@@ -12,6 +12,23 @@ Report privately through GitHub's private vulnerability reporting: open the repo
 
 Please include the revision you tested, the executor (local sandbox or Kubernetes) and OS or cluster setup, the steps or a proof of concept, and what an attacker gains. We will acknowledge the report, work on a fix in a private advisory, and credit you when it is published unless you ask us not to.
 
+## Invariant: text is never executed
+
+Exactly two inputs can make claimcheck run a command, and both come from the person running claimcheck, never from the text being checked:
+
+- **CLI `--repro CMD`**: run in the local sandbox or the Kubernetes executor (`--executor`). With `--base`/`--head` it is run once per revision in temporary worktrees.
+- **GitHub Action `repro` input**: set in the workflow file by the repository owner, and run in the local sandbox.
+
+Nothing else is ever executed, whatever it contains:
+
+- report text (`--report` file), PR titles and bodies, issue bodies, and PR diffs;
+- model output, including a `repro_command` the model extracts (a real Gemma run returned an injected `rm -rf ~` there; it is recorded, never run) and any symbol names;
+- `--expect` and the Action's `expect` input, which are only matched against output;
+- the service API (`POST /v1/investigations`), which refuses a `repro` field with 422 and checks the report statically;
+- signed webhook events and the worker that processes them, which run static checks only.
+
+The only other process claimcheck starts on these paths is a fixed `git rev-parse HEAD` in the checked repo. `unit_tests/test_no_exec_from_text.py` feeds commands that would create a marker file (`touch`, `python3 -c`, backticks, `$(...)`, `; ...`) through the CLI (with and without a model), the Action, the API, and the webhook and worker, and fails if a marker appears or a process is started with that text. A path from text to execution is a vulnerability; report it as below.
+
 ## In scope
 
 - **Local sandbox** (`claimcheck/sandbox.py`): a repro that reaches the network, reads or writes outside its throwaway copy of the repo, sees the caller's environment or secrets, or runs when isolation could not be set up.

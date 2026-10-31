@@ -368,7 +368,8 @@ def live(tmp_path, root):
     log = open(tmp_path / "server.log", "w+")
     process = subprocess.Popen(
         [sys.executable, "-m", "claimcheck.server", "--db", str(tmp_path / "live.db"), "--repo-root", str(root),
-         "--port", str(port)], cwd=tmp_path, env={**os.environ, "CLAIMCHECK_WEBHOOK_SECRET": SECRET},
+         "--port", str(port)], cwd=tmp_path, env={**os.environ, "CLAIMCHECK_WEBHOOK_SECRET": SECRET,
+                                                     "CLAIMCHECK_API_TOKEN": ""},
         stdout=log, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 30

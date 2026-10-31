@@ -1,20 +1,28 @@
 """Pull checkable claims out of free-text reports.
 
-Uses a local open-weight model (Gemma via Ollama). If Ollama is not reachable it falls back
+Uses an open-weight model via Ollama. If Ollama is not reachable it falls back
 to a regex extractor and reports that, so the model name in the result is always truthful.
+
+Settings: OLLAMA_HOST (as Ollama reads it: host:port or an http(s):// URL) picks the server,
+CLAIMCHECK_MODEL (or the CLI's --model-name) the model.
 """
 
+import functools
+import ipaddress
 import json
+import os
 import re
 import secrets
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
 from .models import Claim
 
-MODEL = "gemma3:1b"
-OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL = "gemma3:1b"  # the default model; model_name() applies CLAIMCHECK_MODEL and --model-name
+DEFAULT_HOST = "http://localhost:11434"
+OLLAMA_URL = DEFAULT_HOST + "/api/generate"  # the default endpoint; ollama_base_url() applies OLLAMA_HOST
 MAX_REPORT_CHARS = 16 * 1024  # the model sees at most this much of a report
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -41,14 +49,120 @@ class Extraction:
     expected_error: str = ""
     model: str | None = None  # None means the regex fallback produced this
     truncated: bool = False  # True if the model saw only the first MAX_REPORT_CHARS of the report
+    note: str = ""  # why the regex fallback was used, when it was
 
 
-def _ollama(prompt: str, timeout: int = 120) -> str:
-    body = json.dumps({"model": MODEL, "prompt": prompt, "format": "json", "stream": False,
+class InvalidOllamaHost(ValueError):
+    """OLLAMA_HOST is not host:port or an http(s):// URL."""
+
+
+class UnknownModel(Exception):
+    """Ollama answered, but does not have the model that was asked for."""
+
+
+class OllamaUnreachable(OSError):
+    """No answer from the Ollama server."""
+
+
+class OllamaReply(str):
+    """The model's text, plus the name of the model that produced it."""
+
+    model: str
+
+    def __new__(cls, text: str, model: str) -> "OllamaReply":
+        reply = super().__new__(cls, text)
+        reply.model = model
+        return reply
+
+
+_HOSTPORT = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]*)(?::([0-9]+))?")
+_PATH = re.compile(r"[A-Za-z0-9._~/-]*")
+
+
+def model_name(override: str | None = None) -> str:
+    """The model to ask: --model-name, else CLAIMCHECK_MODEL, else MODEL."""
+    return (override or "").strip() or os.environ.get("CLAIMCHECK_MODEL", "").strip() or MODEL
+
+
+def ollama_base_url(value: str | None = None) -> str:
+    """Read an OLLAMA_HOST value the way Ollama does: no scheme means http on port 11434; http:// and
+    https:// default to ports 80 and 443. Only http and https are accepted. Empty means DEFAULT_HOST."""
+    raw = (value or "").strip()
+    if not raw:
+        return DEFAULT_HOST
+
+    def invalid(why: str) -> InvalidOllamaHost:
+        return InvalidOllamaHost(f"OLLAMA_HOST={raw!r} is not usable ({why}); "
+                                 "give host:port or an http:// or https:// URL")
+
+    if any(c.isspace() or not c.isprintable() or c in "?#@" for c in raw):
+        raise invalid("it contains spaces, a query, a fragment or user info")
+    scheme, has_scheme, rest = raw.partition("://")
+    if not has_scheme:
+        scheme, rest, port = "http", raw, "11434"
+    else:
+        scheme = scheme.lower()
+        if scheme not in ("http", "https"):
+            raise invalid(f"only http and https are accepted, not {scheme}")
+        port = "80" if scheme == "http" else "443"
+    hostport, has_path, path = rest.partition("/")
+    if not hostport.startswith("[") and hostport.count(":") > 1:
+        try:
+            hostport = f"[{ipaddress.IPv6Address(hostport)}]"
+        except ValueError as error:
+            raise invalid("invalid IPv6 address") from error
+    found = _HOSTPORT.fullmatch(hostport)
+    if not found or not _PATH.fullmatch(path):
+        raise invalid("expected host or host:port")
+    host, given_port = found.groups()
+    if not host:
+        if has_scheme or given_port is None:
+            raise invalid("expected a host")
+        host = "localhost"
+    if host.startswith("["):
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError as error:
+            raise invalid("invalid IPv6 address") from error
+    if given_port is not None:
+        if not 0 < int(given_port) < 65536:
+            raise invalid(f"port {given_port} is out of range")
+        port = str(int(given_port))
+    path = ("/" + path).rstrip("/") if has_path else ""
+    return f"{scheme}://{host}:{port}{path}"
+
+
+def _error_text(error: urllib.error.HTTPError) -> str:
+    try:
+        return str(json.loads(error.read()).get("error") or error.reason)
+    except (OSError, ValueError, AttributeError):
+        return str(error.reason)
+
+
+def _ollama(prompt: str, timeout: int = 120, model: str | None = None) -> OllamaReply:
+    model = model_name(model)
+    base = ollama_base_url(os.environ.get("OLLAMA_HOST"))
+    body = json.dumps({"model": model, "prompt": prompt, "format": "json", "stream": False,
                        "options": {"temperature": 0}}).encode()
-    request = urllib.request.Request(OLLAMA_URL, body, {"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.load(response)["response"]
+    request = urllib.request.Request(base + "/api/generate", body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as error:
+        text = _error_text(error)
+        if error.code == 404 and "not found" in text.lower():
+            raise UnknownModel(f"Ollama at {base} has no model {model} ({text})") from error
+        raise OllamaUnreachable(f"Ollama at {base} answered HTTP {error.code} ({text})") from error
+    except (urllib.error.URLError, OSError, TimeoutError) as error:
+        raise OllamaUnreachable(f"Ollama not reachable at {base} ({error})") from error
+    if isinstance(data, dict) and data.get("error"):
+        raise ValueError(f"Ollama at {base} could not answer with {model} ({data['error']})")
+    if not isinstance(data, dict) or not isinstance(data.get("response"), str):
+        raise ValueError(f"Ollama at {base} sent no response text")
+    answered_model = data.get("model")
+    if not isinstance(answered_model, str) or not answered_model.strip():
+        raise ValueError(f"Ollama at {base} sent no valid model name")
+    return OllamaReply(data["response"], answered_model.strip())
 
 
 def _clean_symbols(names) -> list[str]:
@@ -60,7 +174,7 @@ def _clean_symbols(names) -> list[str]:
     return seen
 
 
-def parse_model_output(raw: str, report: str) -> Extraction | None:
+def parse_model_output(raw: str, report: str, model: str = MODEL) -> Extraction | None:
     """Validate what the model said. Names that are not in the report are dropped."""
     try:
         data = json.loads(raw)
@@ -75,7 +189,7 @@ def parse_model_output(raw: str, report: str) -> Extraction | None:
         claims=[Claim("symbol", f"{s}() exists", s) for s in symbols],
         repro_command=command if command in report else "",
         expected_error=expected if expected in report else "",
-        model=MODEL,
+        model=model,
     )
 
 
@@ -115,17 +229,34 @@ def _boundary(report: str) -> str:
             return token
 
 
-def extract_claims(report: str, generate=_ollama) -> Extraction:
+def _fallback(report: str, why: str, warn: bool = False) -> Extraction:
+    """The regex extractor, with the reason the model was not used. Settings mistakes also go to stderr."""
+    extraction = regex_extract(report)
+    extraction.note = f"{why}; used the regex extractor instead"
+    if warn:
+        print(f"claimcheck: {extraction.note}", file=sys.stderr)
+    return extraction
+
+
+def extract_claims(report: str, generate=None, model: str | None = None) -> Extraction:
     """The model sees a truncated, fenced copy of the report and its answer is checked against that
-    copy; the regex extractor, which runs no model, still reads the whole report."""
+    copy; the regex extractor, which runs no model, still reads the whole report.
+
+    `generate(prompt)` defaults to Ollama at OLLAMA_HOST with model_name(model). The result names the
+    model that answered (Ollama's reply says which), or None if the regex fallback was used."""
+    name = model_name(model)
+    if generate is None:
+        generate = functools.partial(_ollama, model=name)
     seen = report[:MAX_REPORT_CHARS]
     try:
         raw = generate(PROMPT.format(report=seen, boundary=_boundary(seen)))
-    except (urllib.error.URLError, OSError, TimeoutError, KeyError, ValueError):
-        return regex_extract(report)
-    extraction = parse_model_output(raw, seen)
+    except (InvalidOllamaHost, UnknownModel) as error:
+        return _fallback(report, str(error), warn=True)
+    except (urllib.error.URLError, OSError, TimeoutError, KeyError, ValueError) as error:
+        return _fallback(report, str(error) or type(error).__name__)
+    extraction = parse_model_output(raw, seen, getattr(raw, "model", None) or name)
     if extraction is None:
-        return regex_extract(report)
+        return _fallback(report, "the model's answer was not a JSON object")
     extraction.truncated = len(seen) < len(report)
     # A small model can miss names that literally appear as `name()`; add those.
     known = {c.target for c in extraction.claims}

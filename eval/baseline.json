@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "source": "python -m claimcheck.evaluate --runs 2 --json on 2026-11-01, revision b2b0045 (sandbox-exec, Python 3.14.7): 19 cases, 19 scored, claims 41/41, verdicts 19/19, wrong confirmed 0, wrong refuted 0",
+  "cases": 19,
+  "scored": 19,
+  "verdict_accuracy": 1.0,
+  "claim_accuracy": 1.0
+}
