@@ -12,6 +12,8 @@ import pytest
 from claimcheck import k8s
 from claimcheck.models import Status
 
+from ._runs import RecordingRun, left_behind
+
 CONTEXT = os.environ.get("CLAIMCHECK_K8S_CONTEXT")
 NAMESPACE = "claimcheck-it"
 IMAGE = os.environ.get("CLAIMCHECK_K8S_IMAGE", "python:3.12-slim")
@@ -32,12 +34,15 @@ def namespace():
 
 @pytest.fixture
 def run_in_pod(tmp_path):
+    recorder = RecordingRun()
+
     def run(script: str, expect: str):
         (tmp_path / "probe.py").write_text(script)
-        executor = k8s.KubernetesExecutor(namespace=NAMESPACE, image=IMAGE, context=CONTEXT, deadline=180)
+        executor = k8s.KubernetesExecutor(namespace=NAMESPACE, image=IMAGE, context=CONTEXT, deadline=180, run=recorder)
         evidence = executor.run_repro(tmp_path, "python3 probe.py", expect, timeout=90)
         assert "egress blocked, verified" in evidence.source, evidence.detail
         return evidence
+    run.recorder = recorder  # the run names this test applied
     return run
 
 
@@ -93,9 +98,11 @@ sys.exit(1)
 
 
 def test_nothing_is_left_behind(run_in_pod):
+    # Only this test's runs: the namespace is shared, other runs and leftovers may be there (#63).
     run_in_pod("raise SystemExit(1)\n", "")
-    left = kubectl("get", "jobs,configmaps,networkpolicies", "-n", NAMESPACE, "-l", k8s.RUN_LABEL, "-o", "name")
-    assert left.stdout.strip() == "", left.stdout
+    names = run_in_pod.recorder.names
+    assert len(names) == 2, names  # the network probe, then the repro
+    assert left_behind(kubectl, NAMESPACE, names) == []
 
 
 def test_cluster_enforces_network_policy():

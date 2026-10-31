@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from claimcheck import cli, report
+from claimcheck import cli, extract, report
 from claimcheck.models import Claim, Evidence, Status, Verdict
 
 
@@ -312,3 +312,81 @@ def test_no_model_skips_host_and_model_settings(repo, tmp_path, monkeypatch, cap
     captured = capsys.readouterr()
     assert requests == [] and captured.err == ""
     assert json.loads(captured.out)["extraction_model"] is None
+
+# Issue #73: the truncation flag reaches the verdict and every output.
+
+class FakeOllamaResponse:
+    def __init__(self, answer):
+        # Real Ollama /api/generate responses name the model that answered.
+        self.body = json.dumps({"model": extract.MODEL, "response": json.dumps(answer)}).encode()
+
+    def read(self, *args):
+        body, self.body = self.body, b""
+        return body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_ollama(monkeypatch, answer):
+    """Replace the HTTP call to Ollama; extract._ollama itself stays the real code."""
+    calls = []
+
+    def urlopen(request, timeout=None):
+        calls.append(request)
+        return FakeOllamaResponse(answer)
+
+    monkeypatch.setattr(extract.urllib.request, "urlopen", urlopen)
+    return calls
+
+
+LONG_REPORT = "Crash in `parse_url()` on long input.\n" + "padding line\n" * 2000  # > 16 KiB
+
+
+def test_run_check_marks_a_long_report_as_truncated(repo, monkeypatch):
+    calls = fake_ollama(monkeypatch, {"symbols": ["parse_url"]})
+    assert len(LONG_REPORT) > extract.MAX_REPORT_CHARS
+    verdict, model = cli.run_check(repo, LONG_REPORT, None, None, "", True)
+    assert calls, "the fake model was not called"
+    assert model == extract.MODEL
+    assert verdict.report_truncated is True
+
+
+def test_run_check_does_not_mark_a_short_report(repo, monkeypatch):
+    fake_ollama(monkeypatch, {"symbols": ["parse_url"]})
+    verdict, model = cli.run_check(repo, "Crash in `parse_url()`", None, None, "", True)
+    assert model == extract.MODEL
+    assert verdict.report_truncated is False
+
+
+def test_cli_outputs_show_truncation_for_a_long_report(repo, tmp_path, monkeypatch, capsys):
+    fake_ollama(monkeypatch, {"symbols": ["parse_url"]})
+    rep = write(tmp_path, "r.txt", LONG_REPORT)
+    sarif = tmp_path / "out.sarif"
+    cli.main(["check", "--repo", str(repo), "--report", rep, "--sarif", str(sarif)])
+    assert "Report truncated to 16 KiB before the model" in capsys.readouterr().out
+    assert json.loads(sarif.read_text())["runs"][0]["properties"]["reportTruncated"] is True
+    cli.main(["check", "--repo", str(repo), "--report", rep, "--json"])
+    assert json.loads(capsys.readouterr().out)["report_truncated"] is True
+
+
+def test_cli_short_report_with_model_is_not_truncated(repo, tmp_path, monkeypatch, capsys):
+    fake_ollama(monkeypatch, {"symbols": ["parse_url"]})
+    rep = write(tmp_path, "r.txt", "Crash in `parse_url()`")
+    cli.main(["check", "--repo", str(repo), "--report", rep, "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["extraction_model"] == extract.MODEL
+    assert data["report_truncated"] is False
+
+
+def test_no_model_never_says_truncated_even_for_a_long_report(repo, tmp_path, monkeypatch, capsys):
+    calls = fake_ollama(monkeypatch, {"symbols": ["parse_url"]})
+    rep = write(tmp_path, "r.txt", LONG_REPORT)
+    cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model"])
+    assert "truncated" not in capsys.readouterr().out.lower()
+    cli.main(["check", "--repo", str(repo), "--report", rep, "--no-model", "--json"])
+    assert json.loads(capsys.readouterr().out)["report_truncated"] is False
+    assert calls == []
