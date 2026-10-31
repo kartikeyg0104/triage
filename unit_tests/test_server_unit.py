@@ -288,7 +288,8 @@ def test_store_schema(db):
     Store(db)
     with closing(sqlite3.connect(db)) as conn:
         columns = [row[1] for row in conn.execute("PRAGMA table_info(investigations)")]
-    assert columns == ["id", "created_at", "source", "delivery_id", "status", "request", "result"]
+    assert columns == ["id", "created_at", "source", "delivery_id", "status", "request", "result", "error", "worker",
+                       "claimed_at", "attempts"]
 
 
 # Entry point
