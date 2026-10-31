@@ -1,0 +1,7 @@
+{
+  "truth": "parse_url is a function at repo/urls.py:1 and UrlParser a class at repo/urls.py:7. Both names the report gives exist.",
+  "expected": {
+    "claims": {"symbol:parse_url": "confirmed", "symbol:UrlParser": "confirmed"},
+    "overall": "supported"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "truth": "The repo is one file that defines parse_url. parse_url_v2 is not defined, created at runtime or mentioned anywhere, so the headline function does not exist.",
+  "expected": {
+    "claims": {"symbol:parse_url_v2": "refuted", "symbol:parse_url": "confirmed"},
+    "overall": "refuted"
+  }
+}

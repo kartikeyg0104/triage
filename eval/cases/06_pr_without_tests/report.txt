@@ -1,0 +1,2 @@
+Refactor: parse_amount() strips separators with str.translate instead of
+str.replace. No behaviour change; the existing tests cover it.

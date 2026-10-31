@@ -1,0 +1,7 @@
+{
+  "truth": "round_cents is defined at repo/money.py:1. The diff changes money.py and adds tests/test_money.py, a test of the new rounding, so the PR does change tests with its source change.",
+  "expected": {
+    "claims": {"symbol:round_cents": "confirmed", "pr_tests": "confirmed"},
+    "overall": "supported"
+  }
+}
