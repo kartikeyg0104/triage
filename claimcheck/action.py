@@ -7,19 +7,29 @@ checks as data. It is never put in a shell command, and a repro command found in
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
+import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import report
 from .cli import run_check
-from .models import Status
+from .models import Evidence, Status, Verdict
 
 MARKER = "<!-- claimcheck -->"
 API = "https://api.github.com"
 REPORT_NAME = "claimcheck-report.json"
 OUTPUT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+
+CHECK_NAME = "claimcheck"
+SUMMARY_LIMIT = 60000  # GitHub rejects check run output.summary over 65535 characters
+ANNOTATIONS_PER_REQUEST = 50  # GitHub's per-request limit for check run annotations
+MAX_ANNOTATIONS = 500  # total cap; anything beyond is noted in the summary
+SHA = re.compile(r"[0-9a-f]{40}")
+SOURCE = re.compile(r"([A-Za-z0-9_./-]+):([1-9][0-9]{0,8})")
+LEVEL = {Status.CONFIRMED: "notice", Status.UNVERIFIED: "warning", Status.REFUTED: "warning"}
 
 
 def event_text(event: dict) -> tuple[int, str, bool] | None:
@@ -77,6 +87,87 @@ def write_outputs(outputs: dict, output_file: str | None) -> None:
             out.writelines(lines)
 
 
+def head_sha(event: dict) -> str | None:
+    """The PR head commit from the event payload, only if it is a full hex SHA."""
+    sha = ((event.get("pull_request") or {}).get("head") or {}).get("sha")
+    return sha if isinstance(sha, str) and SHA.fullmatch(sha) else None
+
+
+def check_conclusion(outcome: str, fail_on_refuted: bool) -> str:
+    if outcome == "supported":
+        return "success"
+    if outcome == "refuted" and fail_on_refuted:
+        return "failure"
+    return "neutral"
+
+
+def truncate_summary(text: str, limit: int = SUMMARY_LIMIT) -> str:
+    """Keep the summary under GitHub's limit, cutting on a line boundary so no table row is half shown."""
+    if len(text) <= limit:
+        return text
+    note = "\n\n_Report truncated to fit the check run summary; the full report is in the PR comment and job summary._\n"
+    body = text[:limit - len(note)]
+    if "\n" in body:
+        body = body[:body.rindex("\n")]
+    return body + note
+
+
+def annotation_for(evidence: Evidence, root: Path, workspace: Path | None = None) -> dict | None:
+    """An annotation for evidence whose source is a repo-relative file:line that exists under root, else None.
+
+    Rejects absolute paths, '..', backslashes and anything resolving (e.g. via a symlink) outside root.
+    """
+    match = SOURCE.fullmatch(evidence.source or "")
+    if not match:
+        return None
+    rel = PurePosixPath(match.group(1))
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts or rel.parts == (".",):
+        return None
+    root = root.resolve()
+    target = (root / rel).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        return None
+    path = target.relative_to(root)
+    if workspace is not None and root.is_relative_to(workspace.resolve()):
+        path = root.relative_to(workspace.resolve()) / path
+    line = int(match.group(2))
+    return {"path": path.as_posix(), "start_line": line, "end_line": line,
+            "annotation_level": LEVEL[evidence.status],
+            "title": f"{evidence.status.value}: {evidence.claim.text}"[:255],
+            "message": evidence.detail[:4000] or evidence.status.value}
+
+
+def create_check_run(repo: str, sha: str, verdict: Verdict, markdown: str, fail_on_refuted: bool,
+                     root: Path, token: str, http=_request, workspace: Path | None = None) -> str:
+    """Create a completed check run on sha; annotations beyond the first 50 are sent in PATCH batches."""
+    annotations = [a for a in (annotation_for(e, root, workspace) for e in verdict.evidence) if a]
+    dropped = max(0, len(annotations) - MAX_ANNOTATIONS)
+    annotations = annotations[:MAX_ANNOTATIONS]
+    if dropped:
+        markdown = f"_{dropped} more annotation(s) not shown; see the table below._\n\n" + markdown
+    counts = ", ".join(f"{sum(e.status == s for e in verdict.evidence)} {s.value}" for s in Status)
+    output = {"title": f"claimcheck: {verdict.outcome} ({counts})", "summary": truncate_summary(markdown)}
+    batches = [annotations[i:i + ANNOTATIONS_PER_REQUEST]
+               for i in range(0, len(annotations), ANNOTATIONS_PER_REQUEST)] or [[]]
+    created = json.loads(http("POST", f"{API}/repos/{repo}/check-runs", token, data={
+        "name": CHECK_NAME, "head_sha": sha, "status": "completed",
+        "conclusion": check_conclusion(verdict.outcome, fail_on_refuted),
+        "output": {**output, "annotations": batches[0]},
+    }))
+    for batch in batches[1:]:
+        http("PATCH", f"{API}/repos/{repo}/check-runs/{int(created['id'])}", token,
+             data={"output": {**output, "annotations": batch}})
+    return "created"
+
+
+def print_untrusted(text: str) -> None:
+    """Print text that holds PR-derived content with workflow commands (::warning file=... etc.) disabled."""
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}")
+    print(text)
+    print(f"::{token}::")
+
+
 def run(env: dict, http=_request) -> int:
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text())
     found = event_text(event)
@@ -86,10 +177,10 @@ def run(env: dict, http=_request) -> int:
     number, text, is_pr = found
     repo_name, token = env["GITHUB_REPOSITORY"], env.get("GITHUB_TOKEN", "")
     diff = fetch_diff(repo_name, number, token, http) if is_pr and token else None
-    verdict, model = run_check(
-        Path(env.get("INPUT_PATH") or "."), text, diff, env.get("INPUT_REPRO") or None,
-        env.get("INPUT_EXPECT", ""), use_model=False,
-    )
+    root = Path(env.get("INPUT_PATH") or ".")
+    verdict, model = run_check(root, text, diff, env.get("INPUT_REPRO") or None,
+                               env.get("INPUT_EXPECT", ""), use_model=False)
+    fail_on_refuted = env.get("INPUT_FAIL_ON_REFUTED") == "true"
     markdown = report.to_markdown(verdict, model)
     report_path = write_report(report.to_json(verdict, model), env)
     counts = {status.value: sum(e.status == status for e in verdict.evidence) for status in Status}
@@ -99,9 +190,19 @@ def run(env: dict, http=_request) -> int:
             summary.write(markdown)
     if env.get("INPUT_COMMENT", "true") == "true" and token:
         print(f"claimcheck: comment {post_comment(repo_name, number, MARKER + chr(10) + markdown, token, http)}")
-    print(markdown)
-    refuted_fails = env.get("INPUT_FAIL_ON_REFUTED") == "true" and verdict.outcome == "refuted"
-    return 1 if refuted_fails else 0
+    sha = head_sha(event)
+    if env.get("INPUT_CHECK_RUN", "true") == "true" and token and sha:
+        workspace = Path(env["GITHUB_WORKSPACE"]) if env.get("GITHUB_WORKSPACE") else None
+        try:
+            result = create_check_run(repo_name, sha, verdict, markdown, fail_on_refuted, root, token, http, workspace)
+            print(f"claimcheck: check run {result}")
+        except urllib.error.HTTPError as error:
+            if error.code not in (403, 404):
+                raise
+            print(f"::warning::claimcheck: could not create the check run (HTTP {error.code}); "
+                  "grant the workflow 'checks: write' permission to get one")
+    print_untrusted(markdown)
+    return 1 if fail_on_refuted and verdict.outcome == "refuted" else 0
 
 
 if __name__ == "__main__":
