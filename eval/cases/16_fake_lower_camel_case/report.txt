@@ -1,0 +1,2 @@
+Security: `truncateSlg` lets a crafted slug overflow the buffer used by slugify()
+and run arbitrary code.
