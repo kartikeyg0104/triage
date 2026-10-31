@@ -22,7 +22,7 @@ kubectl -n claimcheck-service create secret generic claimcheck-secrets \
 kubectl apply -k deploy/service
 ```
 
-Both keys must exist, or the `api` container won't start (`CreateContainerConfigError`). `CLAIMCHECK_WEBHOOK_SECRET` is the HMAC key for `X-Hub-Signature-256`. Without it the server answers every webhook with 503. `CLAIMCHECK_API_TOKEN` is passed through for the API token check. **The server at this revision does not read it yet:** `--help` still says "the investigations API has no authentication". Until it does, anyone who can reach the Service can create and read investigations. That is why the Service is ClusterIP only. Put an authenticating proxy or ingress in front of it before exposing it, and restrict who can reach it with a NetworkPolicy if your cluster enforces them.
+Both keys must exist, or the `api` container won't start (`CreateContainerConfigError`). `CLAIMCHECK_WEBHOOK_SECRET` is the HMAC key for `X-Hub-Signature-256`. Without it the server answers every webhook with 503. `CLAIMCHECK_API_TOKEN` is required: the server refuses to bind `0.0.0.0` without it, and with it every `/v1/investigations*` and dashboard request needs `Authorization: Bearer <token>` (the signed webhook keeps its own HMAC check). The Service is still ClusterIP only; put an ingress with TLS in front of it before exposing it, and restrict who can reach it with a NetworkPolicy if your cluster enforces them.
 
 ## Image
 
