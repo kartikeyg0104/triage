@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claimcheck"
+version = "0.1.0"
+description = "Triage that tests the claims: checks whether a bug, security or PR claim is true and reports the evidence."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+claimcheck = "claimcheck.cli:main"
+
+[tool.setuptools]
+packages = ["claimcheck"]
