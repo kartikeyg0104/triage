@@ -160,3 +160,98 @@ def test_mentions_in_code_or_strings_still_count(tmp_path, filename, source, lin
 def test_commented_out_js_definition_is_not_a_definition(tmp_path):
     (tmp_path / "slug.js").write_text("// function truncateSlg(s) { return s; }\n")
     assert find_symbol(tmp_path, "truncateSlg") == []
+
+
+# --- JS/TS definitions: each form is found on its own line ----------------------------------
+
+JS_TS_DEFINITIONS = [
+    ("a.js", "class Cart {\n  render() {\n    return 1;\n  }\n}\n", "render", 2),
+    ("a.js", "class Cart {\n  static fromJSON(json) {\n    return new Cart(json);\n  }\n}\n", "fromJSON", 2),
+    ("a.js", "class Cart {\n  async checkout(gateway) {\n    await gateway.pay();\n  }\n}\n", "checkout", 2),
+    ("a.js", "class Cart {\n  get total() {\n    return 0;\n  }\n}\n", "total", 2),
+    ("a.js", "class Cart {\n  constructor() {}\n  set owner(name) {\n    this._o = name;\n  }\n}\n", "owner", 3),
+    ("a.js", "class Cart {\n  *items() {\n    yield 1;\n  }\n}\n", "items", 2),
+    ("a.js", "class Cart {\n  addItem(item, qty = parseInt(\"1\", 10)) {\n    return qty;\n  }\n}\n", "addItem", 2),
+    ("a.js", "class Cart {\n  addItem(\n    item,\n    qty,\n  ) {\n    return qty;\n  }\n}\n", "addItem", 2),
+    ("a.jsx", "class Button extends Component {\n  handleClick = () => {\n    this.setState({});\n  };\n}\n", "handleClick", 2),
+    ("a.js", "export default function makeApp() {\n  return {};\n}\n", "makeApp", 1),
+    ("a.js", "export async function fetchUser(id) {\n  return id;\n}\n", "fetchUser", 1),
+    ("a.js", "function* walk(tree) {\n  yield tree;\n}\n", "walk", 1),
+    ("a.js", "module.exports = {\n  load(path) {\n    return path;\n  },\n};\n", "load", 2),
+    ("a.js", "export const api = {\n  base: '/v1',\n  async save(record) {\n    return record;\n  },\n};\n", "save", 3),
+    ("a.js", "export const api = {\n  remove: function (id) {\n    return id;\n  },\n};\n", "remove", 2),
+    ("a.js", "export const api = {\n  rename: (from, to) => to,\n};\n", "rename", 2),
+    ("a.js", "export const api = {\n  ping: async () => true,\n};\n", "ping", 2),
+    ("a.ts", "export interface ShapeOptions {\n  fill: string;\n}\n", "ShapeOptions", 1),
+    ("a.ts", "interface Box<T> extends Base {\n  value: T;\n}\n", "Box", 1),
+    ("a.ts", "export type Unit = 'px' | 'em';\n", "Unit", 1),
+    ("a.ts", "type Mapper<T> = (value: T) => T;\n", "Mapper", 1),
+    ("a.ts", "export enum Kind {\n  Circle,\n  Square,\n}\n", "Kind", 1),
+    ("a.ts", "const enum Direction { Up, Down }\n", "Direction", 1),
+    ("a.ts", "declare function greet(name: string): void;\n", "greet", 1),
+    ("a.ts", "export abstract class Shape {\n  abstract area(): number;\n}\n", "Shape", 1),
+    ("a.ts", "export abstract class Shape {\n  abstract area(): number;\n}\n", "area", 2),
+    ("a.ts", "class Circle {\n  render(): string {\n    return '';\n  }\n}\n", "render", 2),
+    ("a.ts", "class Circle {\n  private compute(x: number): number {\n    return x;\n  }\n}\n", "compute", 2),
+    ("a.ts", "class Circle {\n  scaleBy = (factor: number): Circle => new Circle();\n}\n", "scaleBy", 2),
+    ("a.ts", "class Circle {\n  @log\n  @memo({ size: 2 })\n  describe() {\n    return '';\n  }\n}\n", "describe", 4),
+    ("a.ts", "export const LIMIT: number = 10;\n", "LIMIT", 1),
+    ("a.ts", "export function identity<T>(value: T): T {\n  return value;\n}\n", "identity", 1),
+]
+
+
+@pytest.mark.parametrize("filename,source,name,line", JS_TS_DEFINITIONS)
+def test_js_ts_definition_forms_are_found_with_their_line(tmp_path, filename, source, name, line):
+    (tmp_path / filename).write_text(source)
+    assert find_symbol(tmp_path, name) == [(tmp_path / filename, line)]
+    evidence = check_symbol(tmp_path, name)
+    assert evidence.status is Status.CONFIRMED
+    assert evidence.source == f"{filename}:{line}"
+
+
+# --- calls, comments, strings and types are not definitions ---------------------------------
+
+NOT_DEFINITIONS = [
+    ("a.js", "function run(x) {\n  if (validate(x)) {\n    go();\n  }\n}\n"),
+    ("a.js", "function run() {\n  while (validate()) {\n    step();\n  }\n}\n"),
+    ("a.js", "function run(a) {\n  return validate(a) {\n  }\n}\n"),  # noise: a call followed by a block
+    ("a.js", "function run(cfg) {\n  validate(cfg) {\n  }\n}\n"),
+    ("a.js", "function run(x) {\n  if (x) validate(x)\n  {\n    go();\n  }\n}\n"),
+    ("a.js", "const o = { a: validate(1), b: [validate(2)] };\n"),
+    ("a.js", "const o = {\n  a: 1,\n  ...validate(x),\n};\n"),
+    ("a.js", "const msg = 'validate(x) { is gone }';\n"),
+    ("a.js", "throw new Error(\"function validate was removed in 2.0\");\n"),
+    ("a.js", "const doc = `\nfunction validate(x) {\n  return x;\n}\nclass validate {}\n`;\n"),
+    ("a.js", "/**\n * Old API:\n *   validate(input) {\n * function validate() was removed\n */\nfunction other() {}\nother(validate);\n"),
+    ("a.js", "const re = /function validate\\(/;\nre.test(validate);\n"),
+    ("a.js", "obj.function validate;\nobj.class.validate = 1;\n"),
+    ("a.ts", "interface Api {\n  validate(x: string): boolean;\n}\nuse(validate);\n"),
+    ("a.ts", "type Api = { validate: (x: string) => boolean };\nuse(validate);\n"),
+    ("a.ts", "function make(api: { validate(x: string): boolean }) {\n  return api;\n}\nuse(validate);\n"),
+]
+
+
+@pytest.mark.parametrize("filename,source", NOT_DEFINITIONS)
+def test_calls_comments_strings_and_types_are_not_definitions(tmp_path, filename, source):
+    (tmp_path / filename).write_text(source)
+    assert find_symbol(tmp_path, "validate") == []
+    assert check_symbol(tmp_path, "validate").status is not Status.CONFIRMED
+
+
+def test_name_only_in_a_multiline_js_comment_is_refuted(tmp_path):
+    (tmp_path / "cart.js").write_text("/**\n * clearCart() was removed in 2.0.\n * function clearCart() {\n */\nfunction other() {}\n")
+    evidence = check_symbol(tmp_path, "clearCart")
+    assert evidence.status is Status.REFUTED
+    assert "does not appear" in evidence.detail
+
+
+def test_name_in_code_after_a_multiline_js_comment_is_still_a_mention(tmp_path):
+    (tmp_path / "cart.js").write_text("/*\n old\n*/ register(clearCart);\n")
+    evidence = check_symbol(tmp_path, "clearCart")
+    assert evidence.status is Status.UNVERIFIED
+    assert evidence.source == "cart.js:3"
+
+
+def test_url_in_a_js_regex_is_not_a_comment(tmp_path):
+    (tmp_path / "url.js").write_text("const re = /https?:\\/\\//; register(clearCart);\n")
+    assert check_symbol(tmp_path, "clearCart").source == "url.js:1"
