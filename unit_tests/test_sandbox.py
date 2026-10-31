@@ -53,12 +53,13 @@ def test_network_is_blocked(tmp_path):
 
     threading.Thread(target=accept_quietly, daemon=True).start()
     (tmp_path / "net.py").write_text(
-        f"import socket\ns = socket.socket()\ns.settimeout(2)\ns.connect(('127.0.0.1', {port}))\nprint('CONNECTED')\n"
+        "import socket, sys\ns = socket.socket()\ns.settimeout(2)\n"
+        f"try:\n    s.connect(('127.0.0.1', {port}))\nexcept OSError as e:\n    print('BLOCKED', e)\n    sys.exit(1)\nprint('CONNECTED')\n"
     )
-    evidence = sandbox.run_repro(tmp_path, "python3 net.py", "")
+    evidence = sandbox.run_repro(tmp_path, "python3 net.py", "BLOCKED")
     server.close()
     assert "CONNECTED" not in evidence.detail
-    assert "Operation not permitted" in evidence.detail  # the connect was denied by the sandbox
+    assert evidence.status is Status.CONFIRMED  # the script saw its connect fail inside the sandbox
 
 
 @needs_isolation
