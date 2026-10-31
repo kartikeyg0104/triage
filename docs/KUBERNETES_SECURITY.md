@@ -89,6 +89,46 @@ ServiceAccount (probe, then repro), then checking for leftover objects:
 names, so apply always creates. If you change the executor to re-apply objects, the Role must gain
 `patch`.
 
+## ResourceQuota and LimitRange
+
+`deploy/k8s/quota.yaml` and `deploy/k8s/limitrange.yaml` cap what all runs in `claimcheck` can use
+together, so many concurrent repro Jobs cannot exhaust the cluster. A run has one pod at a time (the
+network probe, then the repro), and both come from `build_job`: requests 100m CPU / 64Mi, limits
+500m / 256Mi. The quota is sized for **10 such pods at once**:
+
+| ResourceQuota `claimcheck-executor` | Hard | Why |
+|---|---|---|
+| `count/pods` | 10 | 10 runs in flight; finished pods count too until the executor deletes their Job |
+| `count/jobs.batch` | 10 | one Job per run |
+| `configmaps` | 12 | one repo ConfigMap per run (up to ~1.2 MiB each), plus `kube-root-ca.crt`, plus one spare |
+| `requests.cpu` / `requests.memory` | 1 / 640Mi | 10 x 100m, 10 x 64Mi |
+| `limits.cpu` / `limits.memory` | 5 / 2560Mi | 10 x 500m, 10 x 256Mi |
+
+| LimitRange `claimcheck-executor` (type Container) | cpu | memory |
+|---|---|---|
+| `defaultRequest` | 100m | 64Mi |
+| `default` (limit) | 500m | 256Mi |
+| `max` | 1 | 512Mi |
+
+The defaults equal the executor's own values, so a container that names no resources gets the same
+and is counted against the quota (a quota on `requests.*`/`limits.*` otherwise rejects such pods).
+`max` is twice the executor's limits. 10 is a starting point for one shared namespace; raise all
+numbers together (N x the per-pod values) if you need more concurrent runs. The ServiceAccount
+cannot create, update, patch or delete ResourceQuotas or LimitRanges, so it cannot lift its own caps.
+
+When the quota is full the executor's Job is still created, but the Job controller is refused the
+pod (`FailedCreate ... exceeded quota`); the executor keeps polling and then reports the run as
+unverified ("the pod did not finish in time"). It does not name the quota as the cause.
+
+Tested by `unit_tests/integration/test_k8s_quota.py` on kind (v1.36, Calico): a run as the
+ServiceAccount is confirmed under the quota, and so are four runs at the same time (the Role needs
+no new permissions); with `--dry-run=server`, the executor's pod is admitted unchanged, a pod with no
+resources gets the defaults, a container above `max` cpu or memory is rejected (`maximum cpu usage
+per Container`), and a pod whose two containers together request 2 CPUs is rejected (`exceeded
+quota ... requests.cpu`). In a temporary namespace with the same two objects, 10 Jobs (suspended)
+and 10 pods (never scheduled) are created and the 11th of each is rejected (`exceeded quota`).
+`unit_tests/test_k8s_manifests.py` checks the files without a cluster (needs PyYAML).
+
 ## What is not enforced or not tested
 
 - **gVisor is untested.** `runtime_class` is passed to the Job, but nothing checks that the
@@ -103,8 +143,9 @@ names, so apply always creates. If you change the executor to re-apply objects, 
   before the first run; it does not watch for later policies.
 - If RBAC refuses the probe pod (wrong namespace, missing Role), the report says the probe "could
   not run" under the NetworkPolicy message; it does not name RBAC as the cause.
-- No ResourceQuota or LimitRange is installed, so the namespace has no cap on the number of Jobs.
-  Each repro pod has its own CPU and memory limits and a deadline.
+- The quota caps the namespace, not one caller: a single client that starts 10 runs can use all of
+  it, and other runs then wait until their deadline. NetworkPolicies and ephemeral storage are not
+  in the quota (each pod's emptyDirs have a `sizeLimit`).
 - Pod Security `latest` follows the cluster's version; pin `enforce-version` if you need the policy
   to stay fixed across upgrades.
 - Only tested on kind with Calico. Managed clusters may add their own admission policies or
