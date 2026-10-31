@@ -20,7 +20,7 @@ def git_revision(repo: Path) -> str:
 def run_check(repo: Path, report_text: str, diff: str | None, repro: str | None, expect: str, use_model: bool,
               run_repro=sandbox.run_repro, base: str | None = None, head: str | None = None):
     extraction = extract.extract_claims(report_text) if use_model else extract.regex_extract(report_text)
-    verdict = Verdict(revision=git_revision(repo))
+    verdict = Verdict(revision=git_revision(repo), report_truncated=extraction.truncated)
     for claim in extraction.claims:
         verdict.evidence.append(checks.check_symbol(repo, claim.target))
     if diff is not None:

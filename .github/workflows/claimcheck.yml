@@ -3,6 +3,10 @@ name: claimcheck
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  issues:
+    # An issue form's repro command is only shown as a suggestion; no `repro` input is set here,
+    # so nothing from an issue is ever run.
+    types: [opened, edited]
 
 permissions:
   contents: read

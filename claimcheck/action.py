@@ -2,6 +2,8 @@
 
 The PR/issue text is untrusted. It is read from the event payload file and handed to the
 checks as data. It is never put in a shell command, and a repro command found in it is never run.
+For an issue submitted through a claimcheck issue form, the form's symbol is checked too and its repro
+command is shown as a suggestion only; the one repro that runs is the workflow's own `repro` input.
 """
 
 import json
@@ -15,7 +17,10 @@ import urllib.request
 from pathlib import Path, PurePosixPath
 
 from . import report
+from .checks import check_symbol
 from .cli import run_check
+from .extract import _clean_symbols
+from .issue_form import parse_issue_form
 from .models import Evidence, Status, Verdict
 
 MARKER = "<!-- claimcheck -->"
@@ -160,6 +165,37 @@ def create_check_run(repo: str, sha: str, verdict: Verdict, markdown: str, fail_
     return "created"
 
 
+def code_span(text: str) -> str:
+    """Show untrusted text as one inline markdown code span that it cannot break out of.
+
+    Newlines are shown as ' ⏎ ' so the value cannot start a heading, HTML block or new paragraph, and
+    the fence is a backtick run longer than any inside the value, padded so edge backticks stay content.
+    """
+    flat = " ⏎ ".join(line.strip() for line in text.splitlines() if line.strip())
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", flat)), default=0) + 1)
+    return f"{fence} {flat} {fence}"
+
+
+def apply_issue_form(body: str | None, root: Path, verdict: Verdict) -> str:
+    """Use a submitted claimcheck issue form: check its affected symbol and return markdown showing its
+    repro command and expected error as a suggestion. The suggested repro is never run.
+
+    Returns "" (and leaves verdict alone) for a body that is not a claimcheck form.
+    """
+    form = parse_issue_form(body)
+    for name in _clean_symbols([form.symbol.strip().strip("`")]):
+        if name not in {e.claim.target for e in verdict.evidence if e.claim.kind == "symbol"}:
+            position = sum(e.claim.kind == "symbol" for e in verdict.evidence)
+            verdict.evidence.insert(position, check_symbol(root, name))
+    if not form.repro_command:
+        return ""
+    lines = ["", f"**suggested repro (not run)**: {code_span(form.repro_command)}"]
+    if form.expected_error:
+        lines.append(f"**expected error (from the issue form)**: {code_span(form.expected_error)}")
+    lines += ["", "_claimcheck only runs the workflow's `repro` input, never a command from the issue._", ""]
+    return "\n".join(lines)
+
+
 def print_untrusted(text: str) -> None:
     """Print text that holds PR-derived content with workflow commands (::warning file=... etc.) disabled."""
     token = secrets.token_hex(16)
@@ -180,8 +216,9 @@ def run(env: dict, http=_request) -> int:
     root = Path(env.get("INPUT_PATH") or ".")
     verdict, model = run_check(root, text, diff, env.get("INPUT_REPRO") or None,
                                env.get("INPUT_EXPECT", ""), use_model=False)
+    suggestion = "" if is_pr else apply_issue_form(event["issue"].get("body"), root, verdict)
     fail_on_refuted = env.get("INPUT_FAIL_ON_REFUTED") == "true"
-    markdown = report.to_markdown(verdict, model)
+    markdown = report.to_markdown(verdict, model) + suggestion
     report_path = write_report(report.to_json(verdict, model), env)
     counts = {status.value: sum(e.status == status for e in verdict.evidence) for status in Status}
     write_outputs({"verdict": verdict.outcome, **counts, "report-json": str(report_path)}, env.get("GITHUB_OUTPUT"))
