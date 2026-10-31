@@ -61,7 +61,7 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
             )
         except subprocess.TimeoutExpired:
             return Evidence(claim, Status.UNVERIFIED, f"timed out after {timeout}s", f"{name}: {command}")
-    output = (proc.stdout + proc.stderr).strip()
+    output = (proc.stdout + proc.stderr).replace(str(target.resolve()), "<repo>").replace(str(target), "<repo>").strip()
     source = f"{name}: {command}"
     if proc.returncode != 0 and expect in output:
         return Evidence(claim, Status.CONFIRMED, f"reproduced: exit {proc.returncode}; {_tail(output)}", source)

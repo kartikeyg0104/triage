@@ -84,4 +84,10 @@ def extract_claims(report: str, generate=_ollama) -> Extraction:
         raw = generate(PROMPT.format(report=report))
     except (urllib.error.URLError, OSError, TimeoutError, KeyError, ValueError):
         return regex_extract(report)
-    return parse_model_output(raw, report) or regex_extract(report)
+    extraction = parse_model_output(raw, report)
+    if extraction is None:
+        return regex_extract(report)
+    # A small model can miss names that literally appear as `name()`; add those.
+    known = {c.target for c in extraction.claims}
+    extraction.claims += [c for c in regex_extract(report).claims if c.target not in known]
+    return extraction
