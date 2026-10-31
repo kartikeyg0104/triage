@@ -19,7 +19,9 @@ import base64
 import dataclasses
 import io
 import json
+import os
 import re
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -29,7 +31,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .models import Claim, Evidence, Status
-from .sandbox import classify
+from .repo_copy import DIR, FILE, LINK, Decision, describe_skipped, walk
+from .sandbox import _with_note, classify
 
 RUN_LABEL = "claimcheck.dev/run"
 MAX_REPO_BYTES = 900_000  # ConfigMaps are capped at 1 MiB
@@ -109,18 +112,41 @@ def _meta(name: str) -> dict:
     return {"name": name, "labels": {"app.kubernetes.io/name": "claimcheck", RUN_LABEL: name}}
 
 
-def pack_repo(repo: Path) -> bytes:
-    def skip(info: tarfile.TarInfo):
-        if set(Path(info.name).parts) & _SKIP:
-            return None
-        info.uid = info.gid = 0
-        info.uname = info.gname = ""
-        return info
+def _entry(name: str, kind: bytes, st: os.stat_result | None = None) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.mode = stat.S_IMODE(st.st_mode) if st else 0o777
+    info.mtime = int(st.st_mtime) if st else 0
+    return info  # uid/gid 0 and no user or group names: nothing about this machine
 
+
+def pack_repo(repo: Path) -> tuple[bytes, list[Decision]]:
+    """The repo as a gzipped tar under `repo/`, built from repo_copy.walk like the local sandbox's
+    copy: files as regular files, links inside the repo as relative links, and links that leave it
+    (absolute, `..`), unresolvable links and special files left out. Returns (tarball, left out)."""
+    root = Path(os.path.realpath(repo))
+    skipped = []
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
-        tar.add(repo, arcname="repo", filter=skip)
-    return buffer.getvalue()
+        tar.addfile(_entry("repo", tarfile.DIRTYPE, os.lstat(root)))
+        for decision in walk(root, frozenset(_SKIP)):
+            name, path = f"repo/{decision.path}", root / decision.path
+            if decision.kind == DIR:
+                tar.addfile(_entry(name, tarfile.DIRTYPE, os.lstat(path)))
+            elif decision.kind == FILE:
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))  # never a link swapped in later
+                with os.fdopen(fd, "rb") as handle:
+                    st = os.fstat(fd)
+                    info = _entry(name, tarfile.REGTYPE, st)
+                    info.size = st.st_size
+                    tar.addfile(info, handle)
+            elif decision.kind == LINK:
+                info = _entry(name, tarfile.SYMTYPE)
+                info.linkname = decision.target
+                tar.addfile(info)
+            else:
+                skipped.append(decision)
+    return buffer.getvalue(), skipped
 
 
 def build_configmap(name: str, tarball: bytes) -> dict:
@@ -246,10 +272,13 @@ class KubernetesExecutor:
     def _run_pod(self, repo: Path, command: str, expect: str, timeout: int, claim: Claim, source: str) -> Evidence:
         """Raises RBACDenied if the identity may not run it; a refused cleanup is noted in the detail."""
         name = f"claimcheck-{uuid.uuid4().hex[:10]}"
+        tarball, skipped = pack_repo(repo)
+        left_out = describe_skipped(skipped)  # said in the evidence, so a run without them is not taken for a full one
         try:
-            configmap = build_configmap(name, pack_repo(repo))
+            configmap = build_configmap(name, tarball)
         except RepoTooLarge as error:
-            return Evidence(claim, Status.UNVERIFIED, f"not run: {error} (too large for a ConfigMap)", source)
+            return _with_note(Evidence(claim, Status.UNVERIFIED, f"not run: {error} (too large for a ConfigMap)", source),
+                              left_out)
         objects = {"apiVersion": "v1", "kind": "List",
                    "items": [configmap, build_network_policy(name),
                              build_job(name, self.image, command, timeout, self.runtime_class)]}
@@ -268,7 +297,7 @@ class KubernetesExecutor:
             note = (f"; cleanup was forbidden by RBAC ({describe_denials(left)}), so this run's objects "
                     f"(label {RUN_LABEL}={name}) may be left behind")
             evidence = dataclasses.replace(evidence, detail=evidence.detail + note)
-        return evidence
+        return _with_note(evidence, left_out)
 
     def _execute(self, name, objects, claim, expect, timeout, source) -> Evidence:
         applied = self._kubectl_or_denied("apply", "-f", "-", input=json.dumps(objects))
