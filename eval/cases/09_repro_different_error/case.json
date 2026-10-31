@@ -1,0 +1,9 @@
+{
+  "truth": "load_config is defined at repo/config.py:1. poc.py does fail (exit 1), but with 'ValueError: not enough values to unpack' on the blank line, before any key is looked up. The reported KeyError never happens. The run shows a different bug, not the reported one.",
+  "repro": "python3 poc.py",
+  "expect": "KeyError: 'port'",
+  "expected": {
+    "claims": {"symbol:load_config": "confirmed", "repro": "unverified"},
+    "overall": "unverified"
+  }
+}

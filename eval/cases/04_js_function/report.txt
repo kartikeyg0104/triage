@@ -1,0 +1,2 @@
+slugify() drops accented letters instead of transliterating them: "café menu"
+becomes "caf-menu". `truncateSlug` can also cut a slug in the middle of a word.

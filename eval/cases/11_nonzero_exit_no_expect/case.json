@@ -1,0 +1,9 @@
+{
+  "truth": "render_table is defined at repo/table.py:1. poc.py exits 1 with IndexError, but the report never says what failure to expect. 'Broken for some inputs' cannot be matched to this or any other failure, so the run does not show that the reported bug is this one.",
+  "repro": "python3 poc.py",
+  "expect": "",
+  "expected": {
+    "claims": {"symbol:render_table": "confirmed", "repro": "unverified"},
+    "overall": "unverified"
+  }
+}

@@ -1,0 +1,2 @@
+Bug: parse_url() returns an empty host for a URL without a scheme, such as
+example.com/docs. The `UrlParser` class has the same problem because it calls it.

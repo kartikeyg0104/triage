@@ -1,0 +1,2 @@
+Security report: remote code execution in parse_url_v2() when the URL contains a
+null byte. The older parse_url() is affected too.

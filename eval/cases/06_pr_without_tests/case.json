@@ -1,0 +1,7 @@
+{
+  "truth": "parse_amount is defined at repo/money.py:1. The diff changes only money.py, but the existing doctests in its docstring (python3 -m doctest money.py) do exercise the changed line before and after the PR. The change is tested even though no test file changed, so the diff alone cannot settle the claim. Unverified is honest; refuted would be false.",
+  "expected": {
+    "claims": {"symbol:parse_amount": "confirmed", "pr_tests": "unverified"},
+    "overall": "unverified"
+  }
+}

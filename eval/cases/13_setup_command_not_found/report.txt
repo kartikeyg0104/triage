@@ -1,0 +1,2 @@
+Segfault in parse_url() with a 100k character URL. Run `sh repro.sh` and look
+for "Segmentation fault in parse_url".

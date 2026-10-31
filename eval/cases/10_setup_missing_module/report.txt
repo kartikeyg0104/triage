@@ -1,0 +1,2 @@
+Fuzzing parse_url() with very long URLs runs out of memory and dies with
+MemoryError. Repro: `python3 poc.py` (it uses my urlfuzz helper).

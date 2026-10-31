@@ -1,0 +1,9 @@
+{
+  "truth": "average_latency is defined at repo/stats.py:1 and returns 0.0 for an empty list. poc.py prints 0.0 and exits 0, so the reported crash does not happen with this command.",
+  "repro": "python3 poc.py",
+  "expect": "ZeroDivisionError: division by zero",
+  "expected": {
+    "claims": {"symbol:average_latency": "confirmed", "repro": "refuted"},
+    "overall": "refuted"
+  }
+}
