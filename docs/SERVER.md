@@ -85,7 +85,25 @@ From Python, pass `writeback=claimcheck.server.github_client.from_env(os.environ
 | `X-Hub-Signature-256` missing, wrong, or not `sha256=` | `401`, nothing stored |
 | Signed, but not `issues` or `pull_request` (e.g. `ping`, `push`) | `202` `{"status": "ignored"}`, nothing stored |
 | Signed, but no `X-GitHub-Delivery`, or not a valid payload | `400` |
-| Same `X-GitHub-Delivery` again | `202` with the same id and `"duplicate": true`; no second row |
+| Signed, valid new delivery, but the repository has reached either intake cap | `429` with `{"detail": ...}`; nothing stored |
+| Same `X-GitHub-Delivery` again | `202` with the same id and `"duplicate": true`, even at an intake cap; no second row |
+
+### Repository intake caps
+
+Each repository can have at most **100 pending investigations** and accept at most **60 new deliveries in a rolling 60-second window**. A new delivery that would exceed either cap gets `429`. Set positive integer environment values before starting the server to change the caps:
+
+```bash
+export CLAIMCHECK_WEBHOOK_MAX_PENDING=100
+export CLAIMCHECK_WEBHOOK_MAX_PER_MINUTE=60
+python -m claimcheck.server --db claimcheck.db --repo-root examples
+```
+
+From Python, `create_app(..., webhook_max_pending=100, webhook_max_per_minute=60)` overrides the corresponding environment values. Invalid or nonpositive values raise `ValueError` at app creation.
+
+- Pending means `received` or `processing`: a worker claim keeps the slot occupied until the investigation is `completed`, `skipped` or `failed`.
+- The minute cap counts accepted `issues` and `pull_request` deliveries regardless of their current status. A delivery expires from that count exactly 60 seconds after acceptance. Duplicate IDs, rejected requests and ignored events consume no slots.
+- Both caps use `repository.full_name` (`owner/repo`) from the payload after its signature is verified. Names match case-insensitively; issues and PRs share the same caps. Headers and client addresses do not select a repository's quota, and other repositories have independent quotas.
+- Deduplication, counts and insertion share one SQLite write transaction. Existing rows count, and caps persist across restarts and apply across server processes sharing the database. Repository indexes are added when an existing database is opened; investigation rows are preserved.
 
 ## Security notes
 
@@ -99,6 +117,7 @@ From Python, pass `writeback=claimcheck.server.github_client.from_env(os.environ
 
 ## Limits
 
+- Webhook intake caps apply only to servers sharing the same SQLite file. The rolling window uses the host's UTC clock; hosts sharing a file need synced clocks. The caps bound pending work and intake rate, but completed investigations are retained, so they do not cap total database size.
 - The worker checks a checkout that is already on disk, at whatever revision it is: it does not clone, fetch or check out the event's commit, and a PR is checked without its diff. Keeping the checkouts current is up to you.
 - `--stale-after` must be longer than the slowest check plus its comment attempt, or a live claim/target reservation can expire. Stale detection uses each host's clock, so workers on several hosts sharing a network file need synced clocks; SQLite over a network filesystem is not recommended anyway. Comment coordination applies only to workers sharing the same SQLite file.
 - Rows are polled, not pushed: a new event waits up to `--poll` seconds.

@@ -1,5 +1,6 @@
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,6 @@ CASE_NAMES = sorted(p.name for p in CASES.iterdir() if p.is_dir()) if CASES.is_d
 # Cases the tool gets wrong today. Only misses that leave a claim unverified may be listed here:
 # a wrong confirmed or wrong refuted answer must fail.
 KNOWN_MISSES: dict[str, str] = {
-    "26_repro_missing_dependency": "the quoted error text `max()` is extracted as an extra symbol claim (comes back unverified, never refuted)",
 }
 
 
@@ -554,3 +554,197 @@ def test_markdown_shows_total_time_and_the_slowest_cases():
     text = evaluate.to_markdown([fast, slow], {**META, "runs": "2"})
     assert "- Wall-clock: 3.500s over 4 runs" in text
     assert "| slow | 3.000 |\n| fast | 0.500 |" in text
+
+
+# --- the executor (local sandbox or Kubernetes), with a fake executor -------------------------
+# The real Kubernetes run needs a cluster: unit_tests/integration/test_evaluate_k8s.py.
+
+REPRO_CASE = {"truth": "poc.py raises boom", "repro": "python3 poc.py", "expect": "boom",
+              "expected": {"claims": {"repro": "confirmed"}, "overall": "supported"}}
+K8S_VERIFIED = "kubernetes[ns-x/default runtime] (egress blocked, verified): python3 poc.py"
+K8S_OPEN = "kubernetes[ns-x/default runtime] (egress open): python3 poc.py"
+
+
+def fake_run_repro(source, status="confirmed", calls=None):
+    from claimcheck.models import Claim, Evidence, Status
+
+    def run_repro(repo, command, expect, timeout=30):
+        if calls is not None:
+            calls.append((Path(repo).name, command, expect))
+        return Evidence(Claim("repro", f"`{command}` reproduces the reported failure", command), Status(status),
+                        "fake executor", source)
+    return run_repro
+
+
+def fake_kubernetes(monkeypatch, source=K8S_VERIFIED, status="confirmed"):
+    """Replace claimcheck.k8s.KubernetesExecutor; returns the list of executors created."""
+    from claimcheck import k8s
+    instances = []
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            self.kwargs, self.calls = kwargs, []
+            self.run_repro = fake_run_repro(source, status, self.calls)
+            instances.append(self)
+
+    monkeypatch.setattr(k8s, "KubernetesExecutor", FakeExecutor)
+    return instances
+
+
+def test_evaluate_runs_repros_through_the_given_executor(tmp_path):
+    calls = []
+    loaded = evaluate.load_case(make_case(tmp_path, data=REPRO_CASE, report="it crashes"))
+    results = evaluate.evaluate([loaded], runs=2, isolated=True, run_repro=fake_run_repro(K8S_VERIFIED, calls=calls))
+    assert calls == [("repo", "python3 poc.py", "boom")] * 2
+    assert [run.repro_source for run in results[0].runs] == [K8S_VERIFIED] * 2
+    assert results[0].correct
+    assert evaluate.egress_verified(results) is True
+
+
+def test_egress_is_verified_only_when_every_repro_run_says_so(tmp_path):
+    loaded = evaluate.load_case(make_case(tmp_path, data=REPRO_CASE, report="it crashes"))
+    plain = evaluate.load_case(make_case(tmp_path, "s"))
+    verified = CaseResult(loaded, [Run({"repro": "confirmed"}, "supported", repro_source=K8S_VERIFIED)])
+    opened = CaseResult(loaded, [Run({"repro": "unverified"}, "unverified", repro_source=K8S_OPEN)])
+    no_repro = CaseResult(plain, [Run({"symbol:parse_url": "confirmed"}, "supported")])
+    assert evaluate.egress_verified([verified, no_repro]) is True
+    assert evaluate.egress_verified([verified, opened]) is False
+    assert evaluate.egress_verified([no_repro]) is None
+
+
+def test_main_with_kubernetes_uses_one_executor_and_records_it(tmp_path, monkeypatch):
+    instances = fake_kubernetes(monkeypatch)
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: None)  # the local sandbox plays no part
+    monkeypatch.setattr(sandbox, "run_repro", lambda *a, **k: pytest.fail("the local sandbox was used"))
+    cases, out, js = tmp_path / "cases", tmp_path / "EVAL.md", tmp_path / "eval.json"
+    make_case(cases, "a", data=REPRO_CASE, report="it crashes")
+    make_case(cases, "b", data=REPRO_CASE, report="it crashes")
+    make_case(cases, "c")
+    argv = ["--cases", str(cases), "--runs", "2", "--executor", "kubernetes", "--kube-context", "kind-x",
+            "--k8s-namespace", "ns-x", "--out", str(out), "--json", str(js)]
+    assert evaluate.main(argv) == 0
+    assert len(instances) == 1, "one executor per evaluation run, so the egress probe runs once"
+    assert instances[0].kwargs == {"namespace": "ns-x", "context": "kind-x"}
+    assert [call[1] for call in instances[0].calls] == ["python3 poc.py"] * 4
+    data, text = json.loads(js.read_text()), out.read_text()
+    assert data["executor"] == {"name": "kubernetes", "context": "kind-x", "namespace": "ns-x", "egress_verified": True}
+    assert data["metrics"]["skipped"] == 0 and data["metrics"]["verdicts_correct"] == 3
+    assert [run["repro_source"] for run in data["cases"][0]["runs"]] == [K8S_VERIFIED] * 2
+    assert data["cases"][2]["runs"][0]["repro_source"] is None
+    assert "--executor kubernetes --kube-context kind-x --k8s-namespace ns-x" in text
+    assert "- Executor: kubernetes (context kind-x, namespace ns-x)" in text
+    assert "- Egress verified: yes (4/4 repro runs)" in text
+    assert "`claimcheck.k8s.KubernetesExecutor.run_repro`" in text and "local sandbox" not in text
+    assert_json_matches_markdown(data, text)
+
+
+def test_main_with_kubernetes_reports_egress_that_was_not_verified(tmp_path, monkeypatch):
+    fake_kubernetes(monkeypatch, source=K8S_OPEN, status="unverified")
+    cases, out, js = tmp_path / "cases", tmp_path / "EVAL.md", tmp_path / "eval.json"
+    make_case(cases, "a", data=REPRO_CASE, report="it crashes")
+    assert evaluate.main(["--cases", str(cases), "--runs", "1", "--executor", "kubernetes",
+                          "--out", str(out), "--json", str(js)]) == 0
+    data, text = json.loads(js.read_text()), out.read_text()
+    assert data["executor"] == {"name": "kubernetes", "context": None, "namespace": "claimcheck", "egress_verified": False}
+    assert "- Egress verified: no (0/1 repro runs)" in text
+    assert data["cases"][0]["overall"]["label"] == "miss"
+
+
+def test_main_uses_the_local_sandbox_by_default(tmp_path, monkeypatch):
+    instances = fake_kubernetes(monkeypatch)
+    calls = []
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("sandbox-exec", []))
+    monkeypatch.setattr(sandbox, "run_repro", fake_run_repro("sandbox-exec: python3 poc.py", calls=calls))
+    cases, out, js = tmp_path / "cases", tmp_path / "EVAL.md", tmp_path / "eval.json"
+    make_case(cases, "a", data=REPRO_CASE, report="it crashes")
+    assert evaluate.main(["--cases", str(cases), "--runs", "1", "--out", str(out), "--json", str(js)]) == 0
+    assert instances == [] and len(calls) == 1
+    data, text = json.loads(js.read_text()), out.read_text()
+    assert data["executor"] == {"name": "local", "context": None, "namespace": None, "egress_verified": False}
+    assert "- Executor: local sandbox" in text and "`claimcheck.sandbox.run_repro`" in text
+    assert "--executor" not in text
+
+
+def test_kubernetes_metrics_match_the_local_run(tmp_path, monkeypatch):
+    fake_kubernetes(monkeypatch)
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("sandbox-exec", []))
+    monkeypatch.setattr(sandbox, "run_repro", fake_run_repro("sandbox-exec: python3 poc.py"))
+    cases = tmp_path / "cases"
+    make_case(cases, "a", data=REPRO_CASE, report="it crashes")
+    make_case(cases, "b")
+    reports = []
+    for executor in ("local", "kubernetes"):
+        out, js = tmp_path / f"{executor}.md", tmp_path / f"{executor}.json"
+        assert evaluate.main(["--cases", str(cases), "--runs", "2", "--executor", executor,
+                              "--out", str(out), "--json", str(js)]) == 0
+        reports.append((json.loads(js.read_text()), out.read_text()))
+    assert reports[0][0]["metrics"] == reports[1][0]["metrics"]
+    assert _metric_labels(reports[0][1]) == _metric_labels(reports[1][1])
+
+
+@pytest.mark.parametrize("source", [None, K8S_OPEN, "sandbox-exec: echo 'egress blocked, verified'",
+                                    "kubernetes[ns-x/default runtime] (egress not verified): " + K8S_VERIFIED])
+def test_egress_report_requires_verified_executor_evidence(source):
+    result = CaseResult(case({"repro": "unverified"}, "unverified", repro="python3 poc.py"),
+                        [Run({"repro": "unverified"}, "unverified", repro_source=source)])
+    assert evaluate.egress_verified([result]) is False
+
+
+def test_egress_is_not_applicable_when_no_repros_ran(tmp_path, monkeypatch):
+    instances = fake_kubernetes(monkeypatch)
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: pytest.fail("local isolation was checked"))
+    cases, out, js = tmp_path / "cases", tmp_path / "EVAL.md", tmp_path / "eval.json"
+    make_case(cases, "a")
+    assert evaluate.main(["--cases", str(cases), "--executor", "kubernetes",
+                          "--out", str(out), "--json", str(js)]) == 0
+    assert instances[0].calls == []
+    assert json.loads(js.read_text())["executor"]["egress_verified"] is None
+    assert "- Egress verified: n/a (no repro runs)" in out.read_text()
+    skipped = CaseResult(case({"repro": "confirmed"}, "supported", repro="python3 poc.py"), [], SKIP_NO_ISOLATION)
+    assert evaluate.egress_verified([skipped]) is None
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("kubectl unavailable"),
+                                 subprocess.TimeoutExpired("kubectl", 120)])
+def test_executor_setup_exception_leaves_repro_unverified(tmp_path, error):
+    def unavailable(repo, command, expect):
+        raise error
+
+    loaded = evaluate.load_case(make_case(tmp_path, data=REPRO_CASE, report="it crashes"))
+    results = evaluate.evaluate([loaded], runs=1, isolated=True, run_repro=unavailable)
+    assert results[0].runs[0].claims == {"repro": "unverified"}
+    assert results[0].runs[0].overall == "unverified"
+    assert not results[0].wrong_confirmed and not results[0].wrong_refuted
+    assert evaluate.egress_verified(results) is False
+
+
+def test_kubernetes_with_model_keeps_executor_and_extraction_metadata(tmp_path, monkeypatch):
+    instances = fake_kubernetes(monkeypatch)
+    fake_model(monkeypatch, {"symbols": []})
+    monkeypatch.setattr(evaluate, "ollama_unavailable", lambda model: "")
+    cases, out, js = tmp_path / "cases", tmp_path / "EVAL.md", tmp_path / "eval.json"
+    make_case(cases, "a", data=REPRO_CASE, report="it crashes")
+    assert evaluate.main(["--cases", str(cases), "--runs", "1", "--executor", "kubernetes",
+                          "--model", "gemma3:1b", "--out", str(out), "--json", str(js)]) == 0
+    assert len(instances[0].calls) == 1
+    data, text = json.loads(js.read_text()), out.read_text()
+    assert data["cases"][0]["runs"][0]["model"] == "gemma3:1b"
+    assert "use_model=True" in text and "`claimcheck.k8s.KubernetesExecutor.run_repro`" in text
+    assert "local sandbox" not in text
+
+
+def test_repro_source_does_not_change_verdict_repeatability():
+    a = Run({"repro": "unverified"}, "unverified", repro_source=K8S_OPEN)
+    b = Run({"repro": "unverified"}, "unverified", repro_source=K8S_VERIFIED)
+    assert CaseResult(case({"repro": "unverified"}, "unverified", repro="python3 poc.py"), [a, b]).repeatable
+
+
+@pytest.mark.parametrize("source", [
+    "kubernetes[ns-x/default runtime] (egress blocked, verified) (image python:3.12-slim; image not pinned by digest): python3 poc.py",
+    "kubernetes[ns-x/gvisor] (egress blocked, verified) (image python@sha256:" + "a" * 64 + "): python3 poc.py",
+])
+def test_egress_is_verified_with_the_image_note_from_the_executor(tmp_path, source):
+    # Since the executor names the repro image (#125), the egress note is followed by an image note.
+    loaded = evaluate.load_case(make_case(tmp_path, data=REPRO_CASE, report="it crashes"))
+    verified = CaseResult(loaded, [Run({"repro": "confirmed"}, "supported", repro_source=source)])
+    assert evaluate.egress_verified([verified]) is True

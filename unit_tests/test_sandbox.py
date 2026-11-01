@@ -16,6 +16,8 @@ from claimcheck.models import Claim, Status
 needs_isolation = pytest.mark.skipif(sandbox.detect_isolation() is None, reason="no network isolation on this machine")
 needs_bwrap = pytest.mark.skipif(not sys.platform.startswith("linux") or not shutil.which("bwrap"),
                                  reason="bubblewrap requires Linux and bwrap")
+needs_macos = pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("sandbox-exec"),
+                                 reason="home-read confinement requires macOS and sandbox-exec")
 
 
 @pytest.fixture
@@ -253,6 +255,137 @@ def test_unshare_launch_remains_unchanged(repo, monkeypatch, repro_process):
     assert options["env"]["HOME"] == str(options["cwd"].parent)
     assert evidence.status is Status.CONFIRMED
     assert evidence.source == "unshare-net: python3 boom.py"
+
+
+def test_macos_probe_uses_the_home_read_deny_profile(tmp_path, monkeypatch):
+    home = tmp_path / 'home "quoted" \\name'
+    home.mkdir()
+    alias = tmp_path / "home-alias"
+    alias.symlink_to(home, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(alias))
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda tool: "/usr/bin/sandbox-exec")
+    probes = []
+
+    def probe(args, **kwargs):
+        probes.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", probe)
+    name, prefix = sandbox.detect_isolation()
+    assert name == "sandbox-exec"
+    profile = prefix[prefix.index("-p") + 1]
+    assert "(deny network*)" in profile
+    assert '(deny file-read* (subpath (param "HOST_HOME")))' in profile
+    assert '(allow file-read* (subpath (param "WORKDIR")))' in profile
+    assert f"HOST_HOME={home.resolve()}" in prefix
+    assert "WORKDIR=/dev/null" in prefix
+    assert str(home) not in profile  # Paths are data, never sandbox profile syntax.
+    assert probes == [prefix + ["true"]]
+
+
+def test_macos_launch_allows_only_its_work_directory_under_home(repo, monkeypatch, repro_process):
+    launches, _ = repro_process
+    monkeypatch.setenv("HOME", str(repo.parent))
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("sandbox-exec", ["sandbox-exec", "-p", "probe"]))
+    evidence = sandbox.run_repro(repo, "python3 boom.py", "crash")
+    args, options = launches[0]
+    profile = args[args.index("-p") + 1]
+    assert '(deny file-read* (subpath (param "HOST_HOME")))' in profile
+    assert '(allow file-read* (subpath (param "WORKDIR")))' in profile
+    assert f"HOST_HOME={repo.parent.resolve()}" in args
+    assert f"WORKDIR={options['cwd'].parent.resolve()}" in args
+    assert options["env"]["HOME"] == str(options["cwd"].parent)
+    assert args[-3:] == ["sh", "-c", "python3 boom.py"]
+    assert evidence.status is Status.CONFIRMED
+    assert evidence.source == "sandbox-exec: python3 boom.py"
+
+
+@pytest.mark.parametrize("code", [0, 1])
+@pytest.mark.parametrize("output", [
+    "sandbox-exec: sandbox_apply: Operation not permitted",
+    "sandbox-exec: string compilation failed: undefined parameter",
+    "cat: /home/private/id_rsa: Operation not permitted",
+    "PermissionError: [Errno 1] Operation not permitted: '/home/private/id_rsa'",
+])
+def test_macos_setup_or_read_denial_never_gives_a_verdict(repo, monkeypatch, repro_process, code, output):
+    _, result = repro_process
+    result.update(returncode=code, stdout="", stderr=output)
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("sandbox-exec", ["sandbox-exec"]))
+    evidence = sandbox.run_repro(repo, "true", "Operation not permitted")
+    assert evidence.status is Status.UNVERIFIED
+    assert "setup or environment failure" in evidence.detail
+    assert evidence.source.startswith("sandbox-exec:")
+
+
+@pytest.fixture
+def macos_home(tmp_path, monkeypatch):
+    """Use a home-like directory so confinement tests never touch real host secrets."""
+    home = tmp_path / 'home "quoted" \\name'
+    home.mkdir()
+    repo = home / "repo"
+    repo.mkdir()
+    work = home / "tmp"
+    work.mkdir()
+    private = home / ".ssh"
+    private.mkdir()
+    secret = private / "id_rsa"
+    secret.write_text(HOST_SECRET + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sandbox.tempfile, "tempdir", str(work))
+    return repo, secret
+
+
+@needs_isolation
+@needs_macos
+@pytest.mark.parametrize("reader", ["cat", "python"])
+@pytest.mark.parametrize("location", ["private", "original", "work-sibling", "alias"])
+def test_macos_cannot_read_home_files_outside_its_copy(macos_home, reader, location):
+    """Absolute paths and aliases must not bypass the copy's filesystem boundary."""
+    repo, secret = macos_home
+    if location == "original":
+        secret = repo / "original.txt"
+        secret.write_text(HOST_SECRET + "\n")
+    elif location == "work-sibling":
+        secret = repo.parent / "tmp" / "sibling.txt"
+        secret.write_text(HOST_SECRET + "\n")
+    elif location == "alias":
+        alias = repo.parent.parent / "home-alias"
+        alias.symlink_to(repo.parent, target_is_directory=True)
+        secret = alias / ".ssh" / "id_rsa"
+    assert secret.read_text().strip() == HOST_SECRET
+    if reader == "cat":
+        command = f"cat {shlex.quote(str(secret))}; exit 1"
+    else:
+        (repo / "read.py").write_text(f"from pathlib import Path\nprint(Path({str(secret)!r}).read_text())\n")
+        command = "python3 read.py"
+    evidence = sandbox.run_repro(repo, command, HOST_SECRET)
+    assert evidence.source.startswith("sandbox-exec:"), evidence.detail
+    assert HOST_SECRET not in evidence.detail
+    assert evidence.status is Status.UNVERIFIED
+    assert "Operation not permitted" in evidence.detail or "Permission denied" in evidence.detail
+
+
+@needs_isolation
+@needs_macos
+def test_macos_copy_and_work_directory_remain_readable_and_writable(macos_home):
+    repo, _ = macos_home
+    (repo / "inside.txt").write_text("inside-content\n")
+    (repo / "normal.py").write_text(
+        "import json, os, tempfile\nfrom pathlib import Path\n"
+        "assert Path('inside.txt').read_text().strip() == 'inside-content'\n"
+        "Path('created.txt').write_text('copy-write')\n"
+        "assert Path('created.txt').read_text() == 'copy-write'\n"
+        "scratch = Path(os.environ['HOME']) / 'scratch.txt'\n"
+        "scratch.write_text('work-write')\nassert scratch.read_text() == 'work-write'\n"
+        "with tempfile.TemporaryFile() as f:\n    f.write(b'temp-write'); f.seek(0); assert f.read() == b'temp-write'\n"
+        "raise RuntimeError(json.dumps('normal-repro'))\n"
+    )
+    evidence = sandbox.run_repro(repo, "python3 normal.py", "normal-repro")
+    assert evidence.source.startswith("sandbox-exec:"), evidence.detail
+    assert evidence.status is Status.CONFIRMED, evidence.detail
+    assert not (repo / "created.txt").exists()
+    assert not list((repo.parent / "tmp").glob("claimcheck-*"))
 
 
 def test_bwrap_repo_path_is_normalised_in_evidence(repo, monkeypatch, repro_process):

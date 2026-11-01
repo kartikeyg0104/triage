@@ -101,7 +101,7 @@ A NetworkPolicy does nothing unless the CNI enforces it, and kind's default CNI 
 
 `deploy/k8s` adds a namespaced Role with only the verbs the executor uses (no Secrets, no exec, nothing cluster-wide), Pod Security `restricted` enforcement, and a ResourceQuota/LimitRange sized for 10 concurrent runs. `--k8s-impersonate system:serviceaccount:claimcheck:claimcheck-executor` runs every kubectl call as that ServiceAccount.
 
-Options: `--k8s-namespace` (default `claimcheck`), `--k8s-image` (default `python:3.12-slim`), `--kube-context`, `--k8s-impersonate`, `--k8s-runtime-class` (for example `gvisor`; passed through but **not tested**).
+Options: `--k8s-namespace` (default `claimcheck`), `--k8s-image` (pin the default image with `--k8s-image python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159`), `--k8s-require-digest` (refuse unpinned images; unverified), `--kube-context`, `--k8s-impersonate`, `--k8s-runtime-class` (for example `gvisor`; passed through but **not tested**).
 
 ## GitHub Action
 
