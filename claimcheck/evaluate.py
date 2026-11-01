@@ -64,7 +64,7 @@ JSON_SCHEMA_VERSION = 1
 SLOWEST = 5  # cases listed under the timing
 ROOT = Path(__file__).resolve().parent.parent
 _STATUSES = tuple(s.value for s in Status)
-_CLAIM_KEY = re.compile(r"^(pr_tests|repro|symbol:[A-Za-z_][A-Za-z0-9_]*)$")
+_CLAIM_KEY = re.compile(r"^(pr_tests|repro|version|symbol:[A-Za-z_][A-Za-z0-9_]*)$")
 _CASE_KEYS = {"truth", "repro", "expect", "expected"}
 # The executor may add an image note after the egress note: "(image python:3.12-slim; ...)".
 _VERIFIED_EGRESS = re.compile(r"^kubernetes\[[^\]\n]+\] \(egress blocked, verified\)(?: \(image [^()\n]*\))?: ")
@@ -225,7 +225,7 @@ def load_case(path: Path) -> Case:
     claims = expected["claims"]
     for key, status in claims.items():
         if not _CLAIM_KEY.match(key):
-            raise fail(f"unknown claim {key!r}; use symbol:<name>, pr_tests or repro")
+            raise fail(f"unknown claim {key!r}; use symbol:<name>, pr_tests, repro or version")
         if status not in _STATUSES:
             raise fail(f"claim {key!r} has status {status!r}; use one of {', '.join(_STATUSES)}")
     overall = expected.get("overall")

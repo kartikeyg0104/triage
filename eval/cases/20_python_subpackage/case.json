@@ -5,7 +5,8 @@
       "symbol:read_stock_rows": "confirmed",
       "symbol:total_quantity": "confirmed",
       "symbol:StockRow": "confirmed",
-      "symbol:build_summary": "confirmed"
+      "symbol:build_summary": "confirmed",
+      "version": "confirmed"
     },
     "overall": "supported"
   }
