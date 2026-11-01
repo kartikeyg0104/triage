@@ -686,3 +686,26 @@ def test_role_binding_grants_the_role_only_to_the_executor(manifests):
     assert binding["metadata"]["namespace"] == "claimcheck"
     assert binding["roleRef"] == {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "claimcheck-executor"}
     assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "claimcheck-executor", "namespace": "claimcheck"}]
+
+
+def test_concurrent_runs_share_one_network_probe(repo):
+    """Fix verification runs base and head at the same time; the probe must still run once."""
+    import threading
+    import time as _time
+
+    class SlowKubectl(FakeKubectl):
+        def __call__(self, args, **kwargs):
+            if "apply" in args:
+                _time.sleep(0.2)  # both threads reach the probe before either finishes
+            return super().__call__(args, **kwargs)
+
+    fake = SlowKubectl(exit_code=1, logs=[k8s.PROBE_OK, "boom", "boom"])
+    ex = executor(fake, require_network_isolation=True)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(ex.network_isolated())) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == [True, True]
+    assert fake.verbs().count("apply") == 1
