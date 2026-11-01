@@ -1,0 +1,15 @@
+{
+  "truth": "repo/src/cache.ts declares the generic type alias Result<T, E = Error> (line 3), the generic class LruCache<K, V extends object = ...> (line 9), the generic function memoize<A extends unknown[], R> (line 32), the generic arrow function mapValues<K extends string, V, R> (line 41), and the generic class InMemoryRepo<T extends Entity> (line 47) with the async method findById returning Promise<Result<T, string>> (line 54). Running it with node --experimental-transform-types shows LruCache, memoize, mapValues and InMemoryRepo exported as functions and InMemoryRepo.prototype.findById a function; Result is a type, which exists in the source though not at runtime. evictAll appears nowhere (undefined on both class prototypes), so the report is refuted.",
+  "expected": {
+    "claims": {
+      "symbol:memoize": "confirmed",
+      "symbol:mapValues": "confirmed",
+      "symbol:findById": "confirmed",
+      "symbol:evictAll": "refuted",
+      "symbol:LruCache": "confirmed",
+      "symbol:InMemoryRepo": "confirmed",
+      "symbol:Result": "confirmed"
+    },
+    "overall": "refuted"
+  }
+}

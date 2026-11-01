@@ -1,5 +1,7 @@
 import json
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,21 +41,38 @@ def repo(tmp_path) -> Repo:
 
 
 class FakeExecutor:
-    """Stands in for sandbox.run_repro / KubernetesExecutor.run_repro and records where it ran."""
+    """Stands in for sandbox.run_repro / KubernetesExecutor.run_repro and records where and when it ran.
 
-    def __init__(self, base: Status = C, head: Status = R, error: Exception | None = None):
+    `delay` maps a version ("buggy" is base, "fixed" is head) to seconds to sleep; `error` is raised on every
+    side, or only on the versions in `fail_on`."""
+
+    def __init__(self, base: Status = C, head: Status = R, error: Exception | None = None,
+                 delay: dict[str, float] | None = None, fail_on: tuple[str, ...] = ("buggy", "fixed")):
         self.statuses = {"buggy": base, "fixed": head}
         self.error = error
+        self.delay = delay or {}
+        self.fail_on = fail_on
         self.runs: list[dict] = []
+        self.lock = threading.Lock()
 
     def __call__(self, repo: Path, command: str, expect: str, timeout: int = 30) -> Evidence:
+        start = time.monotonic()
         version = (repo / "version.txt").read_text().strip()
-        self.runs.append({"dir": Path(repo), "sha": git(repo, "rev-parse", "HEAD"), "version": version,
-                          "command": command, "expect": expect, "timeout": timeout})
-        if self.error:
+        run = {"dir": Path(repo), "sha": git(repo, "rev-parse", "HEAD"), "version": version,
+               "command": command, "expect": expect, "timeout": timeout, "start": start}
+        with self.lock:
+            self.runs.append(run)
+        time.sleep(self.delay.get(version, 0))
+        run["end"] = time.monotonic()
+        run["dir_existed_at_end"] = Path(repo).is_dir()
+        if self.error and version in self.fail_on:
             raise self.error
         status = self.statuses[version]
-        return Evidence(Claim("repro", command, command), status, f"{status.value} on {version}", f"fake: {command}")
+        return Evidence(Claim("repro", command, command), status, f"{status.value} on {version}",
+                        f"fake: {command} on {version}")
+
+    def by_version(self) -> dict[str, dict]:
+        return {run["version"]: run for run in self.runs}
 
 
 def worktrees(path: Path) -> list[str]:
@@ -65,11 +84,13 @@ def verify(repo: Repo, executor, base: str | None = None, head: str | None = Non
                                 "python3 poc.py", "buffer overflow", executor, **kwargs)
 
 
-def test_runs_base_then_head_in_their_own_worktrees(repo):
+def test_runs_base_and_head_in_their_own_worktrees(repo):
     fake = FakeExecutor()
     verify(repo, fake, base="HEAD~1", head="HEAD", timeout=7)
-    assert [run["sha"] for run in fake.runs] == [repo.base, repo.head]
-    assert [run["version"] for run in fake.runs] == ["buggy", "fixed"]
+    runs = fake.by_version()
+    assert len(fake.runs) == 2
+    assert (runs["buggy"]["sha"], runs["fixed"]["sha"]) == (repo.base, repo.head)
+    assert runs["buggy"]["dir"] != runs["fixed"]["dir"]
     for run in fake.runs:
         assert run["dir"].resolve() != repo.path.resolve()
         assert repo.path.resolve() not in run["dir"].resolve().parents
@@ -106,7 +127,7 @@ def test_checkout_is_untouched_and_worktrees_are_removed(repo):
     branch, status = git(repo.path, "symbolic-ref", "HEAD"), git(repo.path, "status", "--porcelain")
     fake = FakeExecutor()
     assert verify(repo, fake).status is C
-    assert [run["version"] for run in fake.runs] == ["buggy", "fixed"]  # committed content, not the dirty tree
+    assert sorted(run["version"] for run in fake.runs) == ["buggy", "fixed"]  # committed content, not the dirty tree
     assert git(repo.path, "rev-parse", "HEAD") == repo.head
     assert git(repo.path, "symbolic-ref", "HEAD") == branch
     assert git(repo.path, "status", "--porcelain") == status
@@ -118,9 +139,57 @@ def test_worktrees_are_removed_when_the_executor_raises(repo):
     fake = FakeExecutor(error=RuntimeError("executor crashed"))
     with pytest.raises(RuntimeError, match="executor crashed"):
         verify(repo, fake)
-    assert len(fake.runs) == 1
-    assert not fake.runs[0]["dir"].exists()
+    assert len(fake.runs) == 2
+    assert not any(run["dir"].exists() for run in fake.runs)
     assert worktrees(repo.path) == [f"worktree {repo.path.resolve()}"]
+
+
+def test_base_and_head_run_concurrently(repo):
+    fake = FakeExecutor(delay={"buggy": 1.0, "fixed": 1.0})
+    assert verify(repo, fake).status is C
+    base, head = fake.by_version()["buggy"], fake.by_version()["fixed"]
+    assert base["start"] < head["end"] and head["start"] < base["end"]  # sequential runs could not overlap
+
+
+@pytest.mark.parametrize("failing", ["buggy", "fixed"])
+def test_one_side_raising_still_waits_for_the_other_and_cleans_up_both(repo, failing):
+    other = {"buggy": "fixed", "fixed": "buggy"}[failing]
+    fake = FakeExecutor(error=RuntimeError(f"{failing} crashed"), fail_on=(failing,), delay={other: 0.3})
+    with pytest.raises(RuntimeError, match=f"{failing} crashed"):
+        verify(repo, fake)
+    runs = fake.by_version()
+    assert set(runs) == {"buggy", "fixed"}
+    assert runs[other]["dir_existed_at_end"]  # its worktree was not removed under it
+    assert not any(run["dir"].exists() for run in fake.runs)
+    assert worktrees(repo.path) == [f"worktree {repo.path.resolve()}"]
+
+
+def test_result_does_not_depend_on_which_side_finishes_first(repo):
+    slow_base = verify(repo, FakeExecutor(delay={"buggy": 0.3}))
+    slow_head = verify(repo, FakeExecutor(delay={"fixed": 0.3}))
+    assert (slow_base.status, slow_base.detail, slow_base.source) == (slow_head.status, slow_head.detail, slow_head.source)
+    assert slow_base.detail.index(f"base {repo.base}") < slow_base.detail.index(f"head {repo.head}")
+    assert slow_base.source.endswith("fake: python3 poc.py on fixed")  # head's executor source, as before
+
+
+def test_worktrees_are_created_one_at_a_time_before_any_repro_runs(repo, monkeypatch):
+    real_git = revisions._git
+    adds: list[tuple[float, float]] = []
+
+    def recording_git(repo_, *args):
+        start = time.monotonic()
+        done = real_git(repo_, *args)
+        if "worktree" in args and "add" in args:
+            adds.append((start, time.monotonic()))
+        return done
+
+    monkeypatch.setattr(revisions, "_git", recording_git)
+    fake = FakeExecutor()
+    verify(repo, fake)
+    assert len(adds) == 2
+    (_, first_end), (second_start, second_end) = sorted(adds)
+    assert first_end <= second_start
+    assert second_end <= min(run["start"] for run in fake.runs)
 
 
 def test_users_own_stale_worktree_is_not_pruned(repo, tmp_path):
@@ -255,5 +324,5 @@ def test_cli_uses_the_kubernetes_executor_on_both_sides(repo, tmp_path, monkeypa
     code = cli.main(check(repo, tmp_path, "--repro", "python3 poc.py", "--expect", "buffer overflow",
                           "--base", repo.base, "--head", repo.head, "--executor", "kubernetes"))
     assert code == 0
-    assert [run["sha"] for run in fake.runs] == [repo.base, repo.head]
+    assert sorted(run["sha"] for run in fake.runs) == sorted([repo.base, repo.head])
     assert f"base {repo.base[:12]} → head {repo.head[:12]}" in capsys.readouterr().out
