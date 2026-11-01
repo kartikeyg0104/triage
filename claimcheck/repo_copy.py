@@ -111,6 +111,7 @@ def copy_repo(src: str | os.PathLike[str], dst: str | os.PathLike[str],
               max_file_bytes: int | None = None) -> list[Decision]:
     """Copy `src` to a new directory `dst` following `walk`. Returns what was left out.
 
+    File permissions are preserved except setuid, setgid and sticky bits.
     A single file over `max_file_bytes` is skipped and reported. Going over `max_total_bytes`
     (bytes of copied files) or `max_files` (directories, files and links created) removes `dst`
     and raises RepoTooLarge. Unset limits use the module defaults, read at call time."""
@@ -152,6 +153,7 @@ def _copy(root: Path, dst: Path, ignored: frozenset[str],
             out.mkdir()
         elif decision.kind == FILE:
             shutil.copy2(root / decision.path, out, follow_symlinks=False)
+            out.chmod(out.stat().st_mode & 0o777)
         else:
             os.symlink(decision.target, out)
     return skipped
