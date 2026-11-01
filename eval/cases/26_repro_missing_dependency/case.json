@@ -1,0 +1,9 @@
+{
+  "truth": "best_match is defined in matching.py, which imports rapidfuzz. requirements.txt declares the dependency, but it is absent from this evaluation's Python environment and the network-denied sandbox does not install dependencies. Executing poc.py stops with ModuleNotFoundError: No module named 'rapidfuzz' before best_match runs. A separate truth test injects a minimal import stub and observes ValueError from max([]); this checks the empty-list path, not the real library. The actual sandbox run has a setup failure, so repro must remain unverified and cannot establish or rule out the reported crash. This expectation requires an environment without rapidfuzz.",
+  "repro": "python3 poc.py",
+  "expect": "ValueError: max() iterable argument is empty",
+  "expected": {
+    "claims": {"symbol:best_match": "confirmed", "repro": "unverified"},
+    "overall": "unverified"
+  }
+}

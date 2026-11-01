@@ -195,7 +195,7 @@ class FakeKubectl:
     """Records kubectl calls and answers like a cluster where the pod ends with `exit_code`."""
 
     def __init__(self, exit_code=1, logs="Traceback\nRuntimeError: boom", pod_state=None, apply_fails=False,
-                 forbid=None):
+                 forbid=None, events=None, event_error=None):
         # logs may be a list: one entry per pod run, in order (e.g. network probe, then the repro)
         # forbid maps a kubectl verb to the stderr it fails with, e.g. an RBAC "is forbidden" message
         self.calls, self.exit_code = [], exit_code
@@ -204,6 +204,7 @@ class FakeKubectl:
         self.pod_state = pod_state
         self.apply_fails = apply_fails
         self.forbid = forbid or {}
+        self.events, self.event_error = events or [], event_error
 
     def __call__(self, args, input=None, capture_output=True, text=True, timeout=None):
         self.calls.append((args, input))
@@ -215,7 +216,18 @@ class FakeKubectl:
                 return subprocess.CompletedProcess(args, 1, "", "error: forbidden")
             return subprocess.CompletedProcess(args, 0, "applied", "")
         if verb == "get":
-            state = self.pod_state or {"terminated": {"exitCode": self.exit_code, "reason": "Error"}}
+            if args[2] == "events":
+                if self.event_error:
+                    return subprocess.CompletedProcess(args, 1, "", self.event_error)
+                applied = next(data for call, data in reversed(self.calls) if call[1] == "apply")
+                name = json.loads(applied)["items"][0]["metadata"]["name"]
+                events = json.loads(json.dumps(self.events).replace('"CURRENT_JOB"', json.dumps(name)))
+                return subprocess.CompletedProcess(args, 0, json.dumps({"items": events}), "")
+            state = self.pod_state
+            if state is None:
+                state = {"terminated": {"exitCode": self.exit_code, "reason": "Error"}}
+            if isinstance(state, list):
+                state = state.pop(0)
             pods = {"items": [{"status": {"containerStatuses": [{"state": state}]}}]}
             return subprocess.CompletedProcess(args, 0, json.dumps(pods), "")
         if verb == "logs":
@@ -483,6 +495,128 @@ def test_unparsed_apply_errors_keep_the_generic_setup_failure(repo):
     evidence = executor(FakeKubectl(apply_fails=True)).run_repro(repo, "true", "boom")
     assert evidence.detail.startswith("setup failure: could not create the Job")
     assert "RBAC" not in evidence.detail
+
+
+# --- admission failures must not hide behind a pod deadline --------------------------------
+
+QUOTA_MESSAGE = ('pods "claimcheck-abc-x" is forbidden: exceeded quota: tiny-pods, '
+                 'requested: count/pods=1, used: count/pods=0, limited: count/pods=0')
+LIMIT_MESSAGE = ('pods "claimcheck-abc-x" is forbidden: maximum cpu usage per Container is 50m, '
+                 'but limit is 500m')
+
+
+def failed_create(message, name="CURRENT_JOB", kind="Job", reason="FailedCreate"):
+    return {"involvedObject": {"kind": kind, "name": name}, "reason": reason, "message": message}
+
+
+@pytest.mark.parametrize("message, category, constraint", [
+    (QUOTA_MESSAGE, "ResourceQuota", "tiny-pods"),
+    ('pods "p" is forbidden: failed quota: required-resources: must specify requests.ephemeral-storage',
+     "ResourceQuota", "required-resources"),
+    (LIMIT_MESSAGE, "LimitRange", "maximum cpu"),
+    ('pods "p" is forbidden: minimum memory usage per Container is 128Mi, but request is 64Mi',
+     "LimitRange", "minimum memory"),
+    ('pods "p" is forbidden: cpu max limit to request ratio per Container is 2, but provided ratio is 5.000000',
+     "LimitRange", "ratio"),
+])
+@pytest.mark.parametrize("stage", ["apply", "events"])
+def test_admission_denials_name_the_constraint_and_stop_before_sleep(repo, monkeypatch, message, category, constraint, stage):
+    def sleep(_):
+        pytest.fail("admission denial waited for the deadline")
+
+    monkeypatch.setattr(k8s.time, "sleep", sleep)
+    fake = FakeKubectl(pod_state={}, events=[failed_create(message)],
+                       forbid={"apply": f'Error from server (Forbidden): error when creating "STDIN": {message}'}
+                       if stage == "apply" else {})
+    evidence = executor(fake, deadline=60).run_repro(repo, "python3 poc.py", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert f"{category} setup failure" in evidence.detail
+    assert constraint in evidence.detail and message in evidence.detail
+    assert "did not finish" not in evidence.detail
+    assert fake.verbs()[-1] == "delete" and "logs" not in fake.verbs()
+    if stage == "events":
+        [args] = [args for args, _ in fake.calls if args[1:3] == ["get", "events"]]
+        selector = args[args.index("--field-selector") + 1]
+        applied = json.loads(fake.calls[0][1])["items"][0]["metadata"]["name"]
+        assert f"involvedObject.name={applied}" in selector
+        assert "involvedObject.kind=Job" in selector and "reason=FailedCreate" in selector
+
+
+@pytest.mark.parametrize("stage", ["apply", "events"])
+def test_admission_denied_probe_keeps_egress_unknown_and_does_not_run_repro(repo, stage):
+    fake = FakeKubectl(pod_state={}, events=[failed_create(QUOTA_MESSAGE)],
+                       forbid={"apply": QUOTA_MESSAGE} if stage == "apply" else {})
+    ex = executor(fake, require_network_isolation=True, deadline=0)
+    for _ in range(2):
+        evidence = ex.run_repro(repo, "python3 poc.py", "boom")
+        assert evidence.status is Status.UNVERIFIED
+        assert "ResourceQuota setup failure" in evidence.detail and "network probe" in evidence.detail
+        assert "tiny-pods" in evidence.detail
+        assert "NetworkPolicy" not in evidence.detail
+        assert "egress not verified" in evidence.source
+    assert fake.verbs().count("apply") == 1 and fake.verbs()[-1] == "delete"
+
+
+@pytest.mark.parametrize("event", [
+    failed_create(QUOTA_MESSAGE, name="another-job"),
+    failed_create(QUOTA_MESSAGE, kind="Pod"),
+    failed_create(QUOTA_MESSAGE, reason="FailedScheduling"),
+    failed_create('pods "p" is forbidden: violates PodSecurity "restricted:latest": privileged'),
+    failed_create("admission webhook denied the request"),
+    failed_create(""),
+])
+def test_unrelated_events_are_not_quota_or_limit_range_denials(repo, event):
+    fake = FakeKubectl(pod_state={}, events=[event])
+    evidence = executor(fake, deadline=0).run_repro(repo, "true", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "did not finish" in evidence.detail
+    assert fake.verbs()[-1] == "delete"
+
+
+def test_admission_events_are_polled_again_until_the_controller_reports_them(repo, monkeypatch):
+    fake = FakeKubectl(pod_state={})
+
+    def sleep(_):
+        assert not fake.events, "did not detect the admission event on the next poll"
+        fake.events = [failed_create(QUOTA_MESSAGE)]
+
+    monkeypatch.setattr(k8s.time, "sleep", sleep)
+    evidence = executor(fake, deadline=60).run_repro(repo, "true", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "ResourceQuota setup failure" in evidence.detail
+    assert len([args for args, _ in fake.calls if args[1:3] == ["get", "events"]]) == 2
+
+
+@pytest.mark.parametrize("error", [
+    'events is forbidden: User "restricted" cannot list resource "events" in API group "" in the namespace "claimcheck"',
+    "Unable to connect to the server: dial tcp: i/o timeout",
+])
+def test_unreadable_events_preserve_the_pod_timeout(repo, error):
+    fake = FakeKubectl(pod_state={}, event_error=error)
+    evidence = executor(fake, deadline=0).run_repro(repo, "true", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "did not finish" in evidence.detail
+
+
+def test_unreadable_events_do_not_prevent_a_pod_from_finishing(repo):
+    fake = FakeKubectl(pod_state=[{}, {"terminated": {"exitCode": 1}}], event_error="error: forbidden")
+    evidence = executor(fake).run_repro(repo, "true", "boom")
+    assert evidence.status is Status.CONFIRMED
+
+
+def test_completed_pods_do_not_consult_admission_events(repo):
+    fake = FakeKubectl(events=[failed_create(QUOTA_MESSAGE)])
+    evidence = executor(fake).run_repro(repo, "true", "boom")
+    assert evidence.status is Status.CONFIRMED
+    assert not [args for args, _ in fake.calls if args[1:3] == ["get", "events"]]
+
+
+def test_admission_failure_still_reports_denied_cleanup(repo):
+    fake = FakeKubectl(forbid={"apply": QUOTA_MESSAGE, "delete": DELETE_FORBIDDEN})
+    evidence = executor(fake).run_repro(repo, "true", "boom")
+    assert evidence.status is Status.UNVERIFIED
+    assert "ResourceQuota setup failure" in evidence.detail and "tiny-pods" in evidence.detail
+    assert "cleanup" in evidence.detail and "left behind" in evidence.detail
 
 
 # --- deploy/k8s: namespace, ServiceAccount, Role, RoleBinding --------------------------------

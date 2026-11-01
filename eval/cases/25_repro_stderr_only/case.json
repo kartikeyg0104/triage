@@ -1,0 +1,9 @@
+{
+  "truth": "verify_blocks is defined at repo/blocks.py:5. poc.py passes an empty block whose stored CRC is 0xFFFFFFFF while zlib.crc32(b'') is 0, so verify_blocks writes 'checksum mismatch in block 1: expected ffffffff, got 00000000' to stderr and poc.py exits 3, every time (no randomness, time or I/O involved). stdout carries only the two 'block N: ... bytes' lines: `python3 poc.py 2>/dev/null` shows no mismatch, `python3 poc.py 1>/dev/null` shows it. The reported failure is real and the repro shows it, on stderr only.",
+  "repro": "python3 poc.py",
+  "expect": "checksum mismatch in block 1",
+  "expected": {
+    "claims": {"symbol:verify_blocks": "confirmed", "repro": "confirmed"},
+    "overall": "supported"
+  }
+}
