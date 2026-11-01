@@ -66,7 +66,8 @@ ROOT = Path(__file__).resolve().parent.parent
 _STATUSES = tuple(s.value for s in Status)
 _CLAIM_KEY = re.compile(r"^(pr_tests|repro|symbol:[A-Za-z_][A-Za-z0-9_]*)$")
 _CASE_KEYS = {"truth", "repro", "expect", "expected"}
-_VERIFIED_EGRESS = re.compile(r"^kubernetes\[[^\]\n]+\] \(egress blocked, verified\): ")
+# The executor may add an image note after the egress note: "(image python:3.12-slim; ...)".
+_VERIFIED_EGRESS = re.compile(r"^kubernetes\[[^\]\n]+\] \(egress blocked, verified\)(?: \(image [^()\n]*\))?: ")
 ReproRunner = Callable[[Path, str, str], Evidence]
 
 

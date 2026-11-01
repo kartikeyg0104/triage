@@ -737,3 +737,14 @@ def test_repro_source_does_not_change_verdict_repeatability():
     a = Run({"repro": "unverified"}, "unverified", repro_source=K8S_OPEN)
     b = Run({"repro": "unverified"}, "unverified", repro_source=K8S_VERIFIED)
     assert CaseResult(case({"repro": "unverified"}, "unverified", repro="python3 poc.py"), [a, b]).repeatable
+
+
+@pytest.mark.parametrize("source", [
+    "kubernetes[ns-x/default runtime] (egress blocked, verified) (image python:3.12-slim; image not pinned by digest): python3 poc.py",
+    "kubernetes[ns-x/gvisor] (egress blocked, verified) (image python@sha256:" + "a" * 64 + "): python3 poc.py",
+])
+def test_egress_is_verified_with_the_image_note_from_the_executor(tmp_path, source):
+    # Since the executor names the repro image (#125), the egress note is followed by an image note.
+    loaded = evaluate.load_case(make_case(tmp_path, data=REPRO_CASE, report="it crashes"))
+    verified = CaseResult(loaded, [Run({"repro": "confirmed"}, "supported", repro_source=source)])
+    assert evaluate.egress_verified([verified]) is True
