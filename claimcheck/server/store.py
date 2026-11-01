@@ -4,13 +4,15 @@ A connection is opened per call so the store is safe to use from the server's th
 several worker processes sharing the same file.
 """
 
+from __future__ import annotations  # `list` is also a Store method name; keep annotations lazy on 3.12
+
 import json
 import sqlite3
 import time
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCHEMA = """
@@ -151,30 +153,57 @@ class Store:
             row = conn.execute(f"SELECT {COLUMNS} FROM investigations WHERE id = ?", (investigation_id,)).fetchone()
         return _row(row) if row else None
 
-    def summary(self) -> dict:
-        """Counts for the dashboard tiles: every row, completed rows by verdict, pending and failed rows."""
+    def list(self, status: str | None = None, limit: int = 50, offset: int = 0, *, verdict: str | None = None,
+             query: str | None = None, oldest_first: bool = False) -> list[Investigation]:
+        """Investigations newest first (insertion order breaks ties), optionally filtered by status,
+        verdict or a plain-text search of id and source."""
+        where, params = [], []
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if verdict is not None:
+            where.append("json_extract(result, '$.verdict') = ?")
+            params.append(verdict)
+        if query:
+            literal = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append("(id LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\')")
+            params += [f"%{literal}%"] * 2
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        order = "ASC" if oldest_first else "DESC"
         with self._connect() as conn:
-            rows = conn.execute("SELECT status, json_extract(result, '$.verdict'), count(*) FROM investigations "
-                                "GROUP BY 1, 2").fetchall()
-        counts = dict.fromkeys(("total", "supported", "refuted", "unverified", "pending", "failed"), 0)
-        for status, verdict, n in rows:
-            counts["total"] += n
-            if status == "completed" and verdict in ("supported", "refuted", "unverified"):
-                counts[verdict] += n
-            elif status in ("received", "processing"):
-                counts["pending"] += n
-            elif status == "failed":
-                counts["failed"] += n
-        return counts
-
-    def list(self, status: str | None = None, limit: int = 50, offset: int = 0) -> list[Investigation]:
-        """Investigations newest first (insertion order breaks ties), optionally only one status."""
-        where, params = ("WHERE status = ?", (status,)) if status is not None else ("", ())
-        with self._connect() as conn:
-            found = conn.execute(f"SELECT {COLUMNS} FROM investigations {where} "
-                                 "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
-                                 params + (limit, offset)).fetchall()
+            found = conn.execute(f"SELECT {COLUMNS} FROM investigations {clause} "
+                                 f"ORDER BY created_at {order}, rowid {order} LIMIT ? OFFSET ?",
+                                 (*params, limit, offset)).fetchall()
         return [_row(row) for row in found]
+
+    def summary(self) -> dict:
+        """Counts for the dashboard: every status and every verdict, zeros included."""
+        statuses = ("received", "processing", "completed", "skipped", "failed")
+        verdicts = ("supported", "refuted", "unverified")
+        with self._connect() as conn:
+            by_status = dict(conn.execute("SELECT status, COUNT(*) FROM investigations GROUP BY status").fetchall())
+            by_verdict = dict(conn.execute("SELECT json_extract(result, '$.verdict'), COUNT(*) FROM investigations "
+                                           "WHERE result IS NOT NULL GROUP BY 1").fetchall())
+        return {"total": sum(by_status.values()),
+                "status": {name: by_status.get(name, 0) for name in statuses},
+                "verdict": {name: by_verdict.get(name, 0) for name in verdicts}}
+
+    def activity(self, hours: int = 24, now: str | None = None) -> list[tuple[str, int]]:
+        """(hour, count) for the last `hours` hours, oldest first, empty hours included."""
+        end = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        end = end.replace(minute=0, second=0, microsecond=0)
+        buckets = [(end - timedelta(hours=n)).strftime("%Y-%m-%dT%H") for n in range(hours - 1, -1, -1)]
+        with self._connect() as conn:
+            counts = dict(conn.execute("SELECT substr(created_at, 1, 13), COUNT(*) FROM investigations "
+                                       "WHERE substr(created_at, 1, 13) >= ? GROUP BY 1", (buckets[0],)).fetchall())
+        return [(bucket, counts.get(bucket, 0)) for bucket in buckets]
+
+    def health(self, recent: int = 10) -> dict:
+        """What the worker side looks like: the oldest waiting row, rows in progress, recent failures."""
+        with self._connect() as conn:
+            oldest = conn.execute("SELECT MIN(created_at) FROM investigations WHERE status = 'received'").fetchone()[0]
+        return {"oldest_waiting": oldest, "processing": self.list("processing", limit=recent),
+                "failed": self.list("failed", limit=recent)}
 
     def claim(self, worker: str, stale_after: float, max_attempts: int = 3,
               now: float | None = None, *, writeback: bool = False) -> Investigation | None:

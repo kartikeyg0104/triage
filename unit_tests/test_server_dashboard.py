@@ -31,8 +31,6 @@ SECRET = "s3cret"
 SCRIPT = "<script>alert(1)</script>"
 IMG = '"><img src=x onerror=alert(2)>'
 HOSTILE = f"{SCRIPT} {IMG} RCE in parse_url_v2() and `parse_url()`"
-PICO_PATH = "/dashboard/static/pico.min.css"
-PICO_FILE = Path(dashboard.__file__).parent / "static" / "pico.min.css"
 SECURITY_HEADERS = {
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
@@ -67,15 +65,14 @@ def assert_secure(response) -> None:
     assert directives["default-src"] == ["'none'"]
     assert "script-src" not in directives  # falls back to default-src 'none': no script at all
     assert directives["frame-ancestors"] == ["'none'"]
-    assert directives["form-action"] == ["'none'"]
+    assert directives["form-action"] == ["'self'"]  # only the GET search form; every route is GET
     assert directives["base-uri"] == ["'none'"]
     assert "'unsafe-inline'" not in csp
-    # Styles: the vendored Pico stylesheet from this origin, plus the one inline <style> block by its hash.
+    # The one inline <style> block is allowed by its hash, and by nothing else.
     styles = re.findall(r"<style>(.*?)</style>", response.text, re.S)
     assert len(styles) == 1
     digest = base64.b64encode(hashlib.sha256(styles[0].encode()).digest()).decode()
-    assert directives["style-src"] == ["'self'", f"'sha256-{digest}'"]
-    assert re.findall(r"<link[^>]*>", response.text) == [f'<link rel="stylesheet" href="{PICO_PATH}">']
+    assert directives["style-src"] == [f"'sha256-{digest}'"]
     assert " style=" not in response.text  # inline style attributes would be blocked anyway
 
 
@@ -105,6 +102,11 @@ def client(root, db):
 def set_created(db: Path, investigation_id: str, created_at: str) -> None:
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.execute("UPDATE investigations SET created_at = ? WHERE id = ?", (created_at, investigation_id))
+
+
+def external_links(html: str) -> list[str]:
+    """Links that leave the dashboard; the sidebar and filters only ever link inside it."""
+    return [h for h in re.findall(r'<a\b[^>]*href="([^"]*)"', html) if not h.startswith("/")]
 
 
 def hostile_result() -> dict:
@@ -243,7 +245,7 @@ def test_detail_links_webhook_source_and_shows_short_tested_revision(client, sto
     assert f'<code title="{revision}">{revision[:7]}</code>' in response.text
     href = f"https://github.com/Octo-1/widget.repo_2/{route}/12"
     assert f'<a href="{href}" rel="noopener noreferrer">{source}</a>' in response.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', response.text) == ["/dashboard", href]
+    assert external_links(response.text) == [href]
 
 
 def test_detail_api_without_github_source_shows_short_tested_revision(client, monkeypatch):
@@ -258,7 +260,7 @@ def test_detail_api_without_github_source_shows_short_tested_revision(client, mo
     assert_secure(detail)
     assert_inert(detail.text)
     assert f'<code title="{revision}">{revision[:7]}</code>' in detail.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', detail.text) == ["/dashboard"]
+    assert external_links(detail.text) == []
 
 
 @pytest.mark.parametrize("source", [
@@ -279,7 +281,7 @@ def test_detail_rejects_malformed_github_source_and_escapes_it(client, store, so
     assert response.status_code == 200
     assert_secure(response)
     assert f"<dt>Source</dt><dd>{dashboard.e(source)}</dd>" in response.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', response.text) == ["/dashboard"]
+    assert external_links(response.text) == []
     assert "<script" not in response.text and "<img" not in response.text
 
 
@@ -396,84 +398,14 @@ def test_dashboard_is_read_only(client, method, path):
     assert client.request(method, path).status_code == 405
 
 
-def test_pages_have_no_forms_scripts_or_external_resources(client, store):
+def test_pages_have_no_scripts_external_resources_or_writing_forms(client, store):
     investigation, _ = store.create("api", "completed", {}, hostile_result())
     for path in ("/", "/dashboard", f"/dashboard/investigations/{investigation.id}"):
         page = client.get(path).text.lower()
-        assert "<form" not in page and "<script" not in page
-        assert re.findall(r"<link[^>]*>", page) == [f'<link rel="stylesheet" href="{PICO_PATH}">']
+        assert "<script" not in page and "<link" not in page and 'method="post"' not in page
+        # The only form is the GET search, which reads and never changes anything.
+        assert re.findall(r"<form\b[^>]*>", page) in ([], ['<form class="search" method="get" action="/dashboard" role="search">'])
         assert "http://" not in page and "https://" not in page
-
-
-# The vendored Pico CSS stylesheet
-
-
-def test_pico_stylesheet_is_served_from_this_origin(client):
-    response = client.get(PICO_PATH)
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/css")
-    assert response.headers["x-content-type-options"] == "nosniff"
-    assert "max-age" in response.headers["cache-control"]
-    assert response.content == PICO_FILE.read_bytes()
-    assert "Pico CSS" in response.text and "Licensed under MIT" in response.text  # banner kept
-
-
-def test_pico_stylesheet_loads_nothing_from_elsewhere():
-    css = PICO_FILE.read_text()
-    assert "@import" not in css
-    # Its only url()s are inline SVG data URIs (form-control icons), never a remote fetch.
-    assert all(u.startswith('"data:') for u in re.findall(r"url\(([^)]{0,6})", css))
-
-
-def test_pico_license_is_shipped_and_packaged():
-    assert "MIT License" in (PICO_FILE.parent / "PICO_LICENSE.md").read_text()
-    pyproject = (Path(dashboard.__file__).parents[2] / "pyproject.toml").read_text()
-    assert '"claimcheck.server" = ["static/*"]' in pyproject
-
-
-@pytest.mark.parametrize("path", ["/dashboard/static/app.py", "/dashboard/static/../app.py",
-                                  "/dashboard/static/%2e%2e/store.py", "/dashboard/static/PICO_LICENSE.md"])
-def test_only_the_stylesheet_is_served_from_static(client, path):
-    assert client.get(path).status_code == 404
-
-
-@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
-def test_stylesheet_route_is_read_only(client, method):
-    assert client.request(method, PICO_PATH).status_code == 405
-
-
-# Layout built on Pico's semantic elements
-
-
-def test_list_page_uses_pico_layout_and_badges(client, store):
-    store.create("api", "completed", {}, {"verdict": "refuted", "evidence": []})
-    page = client.get("/dashboard").text
-    assert '<main class="container">' in page and '<header class="container">' in page
-    assert '<table class="striped">' in page and 'class="overflow-auto"' in page
-    assert '<span class="badge s-completed">completed</span>' in page
-    assert '<span class="badge s-refuted">refuted</span>' in page
-    assert 'aria-current="page"' in page  # the active status filter
-
-
-def test_unknown_status_gets_a_plain_badge(client, store):
-    store.create("api", f"weird{SCRIPT}", {})
-    page = client.get("/dashboard").text
-    assert '<span class="badge">weird&lt;script&gt;' in page
-
-
-def test_detail_page_groups_sections_into_cards(client, store):
-    investigation, _ = store.create("api", "completed", {"repo": "sample", "report": "RCE"}, hostile_result())
-    page = client.get(f"/dashboard/investigations/{investigation.id}").text
-    assert page.count("<article>") == 4  # overview, result, claims, request
-    assert '<span class="badge s-confirmed">confirmed</span>' in page
-    assert '<table class="striped">' in page
-
-
-def test_live_stylesheet_is_served(live):
-    status, headers, text = fetch(live, PICO_PATH)
-    assert status == 200
-    assert LiveResponse(status, headers, text).headers["content-type"].startswith("text/css")
-    assert text == PICO_FILE.read_text()
 
 
 def test_json_api_is_unchanged(client, store):
@@ -570,7 +502,7 @@ def test_live_api_investigation_with_hostile_report_renders_escaped(live):
     assert_inert(detail.text)
     assert "parse_url is defined" in detail.text
     assert '<dt>Revision</dt><dd><span class="muted">-</span></dd>' in detail.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', detail.text) == ["/dashboard"]
+    assert external_links(detail.text) == []
 
     home = LiveResponse(*fetch(live, "/"))
     assert_secure(home)
@@ -585,58 +517,3 @@ def test_live_unknown_id_and_mutating_methods(live):
     assert missing.status_code == 404
     assert_secure(missing)
     assert fetch(live, "/dashboard", "POST", b"")[0] == 405
-
-
-# Summary, readable values and the verdict banner
-
-
-def test_store_summary_counts_verdicts_and_pending(store):
-    for verdict in ("supported", "refuted", "refuted", "unverified"):
-        store.create("api", "completed", {}, {"verdict": verdict, "evidence": []})
-    store.create("github:issues:octo/widgets#1", "received", {}, delivery_id="d-s1")
-    store.create("api", "failed", {})
-    assert store.summary() == {"total": 6, "supported": 1, "refuted": 2, "unverified": 1, "pending": 1, "failed": 1}
-
-
-def test_list_page_shows_summary_tiles(client, store):
-    store.create("api", "completed", {}, {"verdict": "refuted", "evidence": []})
-    store.create("github:issues:octo/widgets#9", "received", {}, delivery_id="d-9")
-    page = client.get("/dashboard").text
-    assert '<section class="tiles">' in page
-    assert '<div class="tile t-refuted"><strong>1</strong><span>refuted</span></div>' in page
-    assert '<div class="tile t-pending"><strong>1</strong><span>pending</span></div>' in page
-
-
-def test_times_and_github_sources_are_readable_with_full_values_kept(client, store, db):
-    made, _ = store.create("github:pull_request:octo/widgets#7", "received", {}, delivery_id="d-r7")
-    set_created(db, made.id, "2026-01-02T03:04:05.678901+00:00")
-    page = client.get("/dashboard").text
-    assert '<time datetime="2026-01-02T03:04:05.678901+00:00">2026-01-02 03:04 UTC</time>' in page
-    assert 'title="github:pull_request:octo/widgets#7">octo/widgets #7 <small class="muted">PR</small>' in page
-
-
-def test_hostile_time_and_source_stay_escaped(client, store, db):
-    made, _ = store.create(f"github:issues:{IMG}#1", "received", {}, delivery_id="d-h1")
-    set_created(db, made.id, SCRIPT)
-    page = client.get("/dashboard").text
-    assert "<script" not in page and "<img" not in page
-
-
-def test_detail_has_verdict_banner_with_claim_counts(client, store):
-    investigation, _ = store.create("api", "completed", {"repo": "sample", "report": "x\n" * 30},
-                                    {**hostile_result(), "verdict": "refuted"})
-    page = client.get(f"/dashboard/investigations/{investigation.id}").text
-    assert '<div class="banner v-refuted">' in page
-    assert "1 refuted" in page and "1 confirmed" in page
-    assert "<details" in page  # long request text is collapsible
-
-
-def test_hostile_verdict_gets_a_plain_banner(client, store):
-    investigation, _ = store.create("api", "completed", {}, hostile_result())
-    page = client.get(f"/dashboard/investigations/{investigation.id}").text
-    assert '<div class="banner">' in page and "<script" not in page
-
-
-def test_empty_list_shows_how_to_start(client):
-    page = client.get("/dashboard").text
-    assert "No investigations" in page and "POST /v1/investigations" in page

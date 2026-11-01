@@ -126,7 +126,7 @@ From Python, `create_app(..., webhook_max_pending=100, webhook_max_per_minute=60
 
 ## Dashboard
 
-The server also renders a small read-only HTML dashboard from the same SQLite file (no JavaScript, no build step, nothing loaded from another host). It is styled with [Pico CSS](https://picocss.com) v2.0.6 (MIT), vendored in `claimcheck/server/static/` with its license and served from `GET /dashboard/static/pico.min.css`; it follows the system light/dark setting:
+The server also renders a read-only HTML dashboard from the same SQLite file (no JavaScript, no build step, nothing loaded from another host): a sidebar with verdict and status filters and their counts, a menu bar with search, sort and a Live mode (`?live=1`, a 10-second refresh), an overview with a verdict strip, a 24-hour activity chart and KPI tiles, a claim strip per investigation, and a Health page (`/dashboard/health`). Charts are inline SVG; it follows the system light/dark setting:
 
 | Path | Shows |
 |---|---|
@@ -136,8 +136,8 @@ The server also renders a small read-only HTML dashboard from the same SQLite fi
 Open `http://127.0.0.1:8080/` in a browser. The JSON API is unchanged. With `CLAIMCHECK_API_TOKEN` set, a browser does not send a bearer token by itself: use a client that adds the `Authorization` header (`curl -H`, a header-injecting extension, or an authenticating proxy that adds it).
 
 - **Escaping.** Report text, webhook titles and bodies, and every value derived from them are untrusted. Every value is escaped with `html.escape` before it is written to the page, so `<script>alert(1)</script>` or `"><img onerror=...>` shows up as text. Status values only become CSS classes if they are one of the known statuses.
-- **Headers.** Every dashboard response, including the `400`, `401` and `404` pages, sends `Content-Security-Policy: default-src 'none'; style-src 'self' 'sha256-...'; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` (no script runs at all; styles only from this origin, i.e. the vendored Pico file, plus the page's one inline style block by its hash), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and `Cache-Control: no-store`.
-- **Read-only.** Only `GET` routes and no forms; anything else is `405`.
+- **Headers.** Every dashboard response, including the `400`, `401` and `404` pages, sends `Content-Security-Policy: default-src 'none'; style-src 'sha256-...'; img-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` (no script runs at all, only the page's one inline style block is allowed, by its hash, and the only form is the GET search), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and `Cache-Control: no-store`.
+- **Read-only.** Only `GET` routes; the one form is a GET search. Anything else is `405`.
 - **Authentication** is the same as the API's: the bearer token when `CLAIMCHECK_API_TOKEN` is set, otherwise open on a loopback host only. It shows report and event text to anyone who can reach it.
 
 ## Container

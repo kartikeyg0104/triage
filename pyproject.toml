@@ -21,5 +21,3 @@ claimcheck = "claimcheck.cli:main"
 [tool.setuptools]
 packages = ["claimcheck", "claimcheck.server"]
 
-[tool.setuptools.package-data]
-"claimcheck.server" = ["static/*"]
