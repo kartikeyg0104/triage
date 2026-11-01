@@ -277,7 +277,8 @@ def test_real_git_uses_event_commits_and_preserves_checkout(tmp_path, repo, base
     executor = RevisionExecutor(base_status, head_status)
     result, api, comment, report = run_action(tmp_path, root, base, head, run_repro=executor,
                                              INPUT_VERIFY_FIX="true", INPUT_FAIL_ON_REFUTED="true")
-    assert [call[1:] for call in executor.calls] == [(base, REPRO, EXPECT), (head, REPRO, EXPECT)]
+    # Base and head run concurrently (#60), so only the set of calls is fixed, not their order.
+    assert sorted(call[1:] for call in executor.calls) == sorted([(base, REPRO, EXPECT), (head, REPRO, EXPECT)])
     assert [r["status"] for r in fix_rows(report)] == [expected]
     assert repro_rows(report) == []
     assert base in comment and head in comment
