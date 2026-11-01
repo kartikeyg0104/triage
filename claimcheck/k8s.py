@@ -29,6 +29,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -217,16 +218,24 @@ def build_job(name: str, image: str, command: str, timeout: int, runtime_class: 
                      "template": {"metadata": {"labels": _meta(name)["labels"]}, "spec": pod}}}
 
 
+def _image_pinned(image: str) -> bool:
+    """A digest marker alone is not a pin: require a complete SHA-256 reference."""
+    return re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image) is not None
+
+
 class KubernetesExecutor:
     def __init__(self, namespace: str = "claimcheck", image: str = "python:3.12-slim", runtime_class: str | None = None,
                  context: str | None = None, deadline: int | None = None, poll_interval: float = 2.0,
-                 require_network_isolation: bool = True, impersonate: str | None = None, run=subprocess.run):
+                 require_network_isolation: bool = True, impersonate: str | None = None, run=subprocess.run,
+                 require_digest: bool = False):
         """`impersonate` runs every kubectl call as that user (`kubectl --as`), for example
         `system:serviceaccount:claimcheck:claimcheck-executor` from deploy/k8s."""
         self.namespace, self.image, self.runtime_class = namespace, image, runtime_class
         self.context, self.deadline, self.poll_interval, self._run = context, deadline, poll_interval, run
         self.require_network_isolation, self.impersonate = require_network_isolation, impersonate
+        self.require_digest = require_digest
         self._isolated: bool | None = None
+        self._probe_lock = threading.Lock()  # base and head may call run_repro concurrently
         self._probe_denied: RBACDenied | AdmissionDenied | None = None
 
     def _kubectl(self, verb: str, *args: str, input: str | None = None) -> subprocess.CompletedProcess:
@@ -270,6 +279,10 @@ class KubernetesExecutor:
 
     def network_isolated(self) -> bool:
         """Run the probe once under a deny-all policy. Setup refusals are cached too."""
+        with self._probe_lock:
+            return self._network_isolated_locked()
+
+    def _network_isolated_locked(self) -> bool:
         if self._isolated is None and self._probe_denied is None:
             with tempfile.TemporaryDirectory(prefix="claimcheck-probe-") as probe_dir:
                 Path(probe_dir, "probe.py").write_text(PROBE_SCRIPT)
@@ -284,7 +297,9 @@ class KubernetesExecutor:
 
     def _source(self, command: str) -> str:
         network = {True: "egress blocked, verified", False: "egress open", None: "egress not verified"}[self._isolated]
-        return f"kubernetes[{self.namespace}/{self.runtime_class or 'default runtime'}] ({network}): {command}"
+        pinning = "image pinned by digest" if _image_pinned(self.image) else "image not pinned by digest"
+        return (f"kubernetes[{self.namespace}/{self.runtime_class or 'default runtime'}] ({network}) "
+                f"(image {self.image}; {pinning}): {command}")
 
     def _rbac_failure(self, claim: Claim, error: RBACDenied, stage: str, command: str) -> Evidence:
         return Evidence(claim, Status.UNVERIFIED,
@@ -298,7 +313,18 @@ class KubernetesExecutor:
                         self._source(command))
 
     def run_repro(self, repo: Path, command: str, expect: str, timeout: int = 30) -> Evidence:
+        """Keep the image warning on every result, without changing its status or basis."""
+        evidence = self._run_repro(repo, command, expect, timeout)
+        if not _image_pinned(self.image):
+            evidence = dataclasses.replace(evidence, detail=evidence.detail + "; image not pinned by digest")
+        return evidence
+
+    def _run_repro(self, repo: Path, command: str, expect: str, timeout: int) -> Evidence:
         claim = Claim("repro", f"`{command}` reproduces the reported failure", command)
+        if self.require_digest and not _image_pinned(self.image):
+            return Evidence(claim, Status.UNVERIFIED,
+                            "refused to run: --k8s-require-digest requires an image pinned with @sha256: "
+                            "and 64 hexadecimal digits", self._source(command))
         if self.require_network_isolation and not self.network_isolated():
             if isinstance(self._probe_denied, RBACDenied):
                 return self._rbac_failure(claim, self._probe_denied, "network probe (the repro was not run)", command)
