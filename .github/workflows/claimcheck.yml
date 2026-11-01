@@ -7,6 +7,8 @@ on:
     # An issue form's repro command is only shown as a suggestion; no `repro` input is set here,
     # so nothing from an issue is ever run.
     types: [opened, edited]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
