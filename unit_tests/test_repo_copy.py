@@ -1,9 +1,13 @@
+import io
 import os
 import stat
+import tarfile
+from pathlib import Path
 
 import pytest
 
-from claimcheck import repo_copy
+from claimcheck import k8s, repo_copy, sandbox
+from claimcheck.models import Status
 
 SECRET = "host-secret-do-not-copy"
 
@@ -176,6 +180,47 @@ def test_executable_bit_is_preserved(layout):
     script.chmod(0o755)
     repo_copy.copy_repo(repo, dst)
     assert os.stat(dst / "run.sh").st_mode & stat.S_IXUSR
+
+
+@pytest.mark.parametrize(("mode", "expected"), [
+    (0o755, 0o755), (0o751, 0o751), (0o640, 0o640),
+    (0o4755, 0o755), (0o2751, 0o751), (0o1750, 0o750), (0o7755, 0o755),
+])
+def test_copy_preserves_permissions_without_special_bits(tmp_path: Path, mode: int, expected: int):
+    """Keep ordinary permissions without carrying privilege bits into the sandbox."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    script = repo / "run_poc.sh"
+    script.write_text("#!/bin/sh\nprintf 'poc-ran\\n'\nexit 1\n")
+    script.chmod(mode)
+    if stat.S_IMODE(script.stat().st_mode) != mode:
+        pytest.skip("filesystem does not retain requested mode bits")
+    dst = tmp_path / "copy"
+    assert repo_copy.copy_repo(repo, dst) == []
+    assert stat.S_IMODE((dst / script.name).stat().st_mode) == expected
+    assert stat.S_IMODE(script.stat().st_mode) == mode
+
+
+@pytest.mark.skipif(sandbox.detect_isolation() is None, reason="no network isolation on this machine")
+def test_executable_script_runs_in_local_sandbox(tmp_path: Path):
+    """Execute the repro through its shebang in the real sandbox copy."""
+    script = tmp_path / "run_poc.sh"
+    script.write_text("#!/bin/sh\nprintf 'poc-ran\\n'\nexit 1\n")
+    script.chmod(0o755)
+    evidence = sandbox.run_repro(tmp_path, "./run_poc.sh", "poc-ran")
+    assert evidence.status is Status.CONFIRMED
+    assert "poc-ran" in evidence.detail
+
+
+def test_kubernetes_archive_preserves_executable_permissions(tmp_path: Path):
+    """Inspect the actual archive without requiring a cluster."""
+    script = tmp_path / "run_poc.sh"
+    script.write_text("#!/bin/sh\nprintf 'poc-ran\\n'\nexit 1\n")
+    script.chmod(0o751)
+    data, skipped = k8s.pack_repo(tmp_path)
+    assert skipped == []
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        assert archive.getmember("repo/run_poc.sh").mode == 0o751
 
 
 def test_hard_link_content_is_copied(layout):
