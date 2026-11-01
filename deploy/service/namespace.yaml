@@ -1,0 +1,13 @@
+# Every pod here must meet the "restricted" Pod Security Standard. enforce rejects pods that do
+# not; audit and warn also flag Deployments whose pod template would not.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: claimcheck-service
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
