@@ -1,0 +1,3 @@
+Fix: page_count() floored instead of rounding up, so 11 items at 10 per page showed one
+page and the 11th item was unreachable. This PR rounds up and adds parametrized tests for
+the boundary cases. page_slice() is unchanged.

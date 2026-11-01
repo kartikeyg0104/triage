@@ -1,0 +1,9 @@
+# The worker's --repos map: {"owner/repo": "path/under/repo-root"}. Events for repos not listed
+# are skipped. Every path must be a directory under /repos, or the worker refuses to start.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claimcheck-repos
+data:
+  repos.json: |
+    {}

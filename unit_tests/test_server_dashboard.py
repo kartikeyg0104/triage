@@ -226,6 +226,79 @@ def test_list_escapes_hostile_source_status_and_verdict(client, store):
 # Detail page
 
 
+@pytest.mark.parametrize("event, route", [("issues", "issues"), ("pull_request", "pull")])
+def test_detail_links_webhook_source_and_shows_short_tested_revision(client, store, event, route):
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    source = f"github:{event}:Octo-1/widget.repo_2#12"
+    request = {"event": "issues", "repo": "someone/else", "number": 99,
+               "text": f'{HOSTILE} https://evil.invalid/wrong "https://github.com/someone/else/issues/99"'}
+    investigation, _ = store.create(source, "completed", request, {"revision": revision, "evidence": []})
+    response = client.get(f"/dashboard/investigations/{investigation.id}")
+    assert response.status_code == 200
+    assert_secure(response)
+    assert_inert(response.text)
+    assert f'<code title="{revision}">{revision[:7]}</code>' in response.text
+    href = f"https://github.com/Octo-1/widget.repo_2/{route}/12"
+    assert f'<a href="{href}" rel="noopener noreferrer">{source}</a>' in response.text
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', response.text) == ["/dashboard", href]
+
+
+def test_detail_api_without_github_source_shows_short_tested_revision(client, monkeypatch):
+    revision = "fedcba9876543210fedcba9876543210fedcba98"
+    monkeypatch.setattr("claimcheck.cli.git_revision", lambda repo: revision)
+    response = client.post("/v1/investigations", json={
+        "repo": "sample", "report": f"{HOSTILE} https://github.com/octo/widgets/issues/12"})
+    assert response.status_code == 201
+    created = response.json()
+    assert created["source"] == "api" and created["result"]["revision"] == revision
+    detail = client.get(f"/dashboard/investigations/{created['id']}")
+    assert_secure(detail)
+    assert_inert(detail.text)
+    assert f'<code title="{revision}">{revision[:7]}</code>' in detail.text
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', detail.text) == ["/dashboard"]
+
+
+@pytest.mark.parametrize("source", [
+    f"github:issues:octo/widgets{IMG}#12", f"github:pull_request:octo/{SCRIPT}#12",
+    "github:issues:https://evil.invalid/widgets#12", "github:issues:octo/../widgets#12",
+    "github:issues:octo/..#12", "github:issues:octo/.#12",
+    "github:issues:octo/widgets#12?next=https://evil.invalid", "github:issues:octo/widgets#12\n",
+    "prefixgithub:issues:octo/widgets#12", "github:issues:octo/widgets#12/suffix",
+    "github:issues:octo/widgets#0", "github:issues:octo/widgets#-12",
+    "github:issues:octo/widgets#１２", "github:issues:octo/widgets%22#12",
+    "github:push:octo/widgets#12", "octo/widgets#12",
+])
+def test_detail_rejects_malformed_github_source_and_escapes_it(client, store, source):
+    investigation, _ = store.create(source, "received", {
+        "event": "issues", "repo": "octo/widgets", "number": 12,
+        "text": "https://github.com/octo/widgets/issues/12"})
+    response = client.get(f"/dashboard/investigations/{investigation.id}")
+    assert response.status_code == 200
+    assert_secure(response)
+    assert f"<dt>Source</dt><dd>{dashboard.e(source)}</dd>" in response.text
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', response.text) == ["/dashboard"]
+    assert "<script" not in response.text and "<img" not in response.text
+
+
+def test_detail_revision_tooltip_and_short_text_are_escaped(client, store):
+    revision = f"{IMG}{SCRIPT}"
+    investigation, _ = store.create("api", "completed", {}, {"revision": revision, "evidence": []})
+    response = client.get(f"/dashboard/investigations/{investigation.id}")
+    assert_secure(response)
+    assert_inert(response.text)
+    assert f'<code title="{dashboard.e(revision)}">{dashboard.e(revision[:7])}</code>' in response.text
+
+
+@pytest.mark.parametrize("revision", [None, "", [SCRIPT], {"sha": IMG}])
+def test_detail_missing_or_malformed_revision_remains_inert(client, store, revision):
+    investigation, _ = store.create("api", "completed", {}, {"revision": revision, "evidence": []})
+    response = client.get(f"/dashboard/investigations/{investigation.id}")
+    assert response.status_code == 200
+    assert_secure(response)
+    assert f"<dt>Revision</dt><dd>{dashboard.block(revision)}</dd>" in response.text
+    assert "<script" not in response.text and "<img" not in response.text
+
+
 def test_detail_shows_each_claim_with_status_basis_detail_and_source(client, store):
     investigation, _ = store.create("api", "completed", {"repo": "sample", "report": "RCE"}, {
         "verdict": "refuted", "extraction_model": None, "revision": "abc123", "evidence": [
@@ -368,7 +441,8 @@ def live(tmp_path, root):
     log = open(tmp_path / "server.log", "w+")
     process = subprocess.Popen(
         [sys.executable, "-m", "claimcheck.server", "--db", str(tmp_path / "live.db"), "--repo-root", str(root),
-         "--port", str(port)], cwd=tmp_path, env={**os.environ, "CLAIMCHECK_WEBHOOK_SECRET": SECRET},
+         "--port", str(port)], cwd=tmp_path, env={**os.environ, "CLAIMCHECK_WEBHOOK_SECRET": SECRET,
+                                                     "CLAIMCHECK_API_TOKEN": ""},
         stdout=log, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 30
@@ -406,6 +480,8 @@ def test_live_webhook_with_hostile_title_renders_escaped(live):
     assert detail.status_code == 200
     assert_secure(detail)
     assert_inert(detail.text)
+    assert ('<a href="https://github.com/octo/widgets/issues/12" rel="noopener noreferrer">'
+            'github:issues:octo/widgets#12</a>') in detail.text
 
 
 def test_live_api_investigation_with_hostile_report_renders_escaped(live):
@@ -418,6 +494,8 @@ def test_live_api_investigation_with_hostile_report_renders_escaped(live):
     assert_secure(detail)
     assert_inert(detail.text)
     assert "parse_url is defined" in detail.text
+    assert '<dt>Revision</dt><dd><span class="muted">-</span></dd>' in detail.text
+    assert re.findall(r'<a\b[^>]*href="([^"]*)"', detail.text) == ["/dashboard"]
 
     home = LiveResponse(*fetch(live, "/"))
     assert_secure(home)

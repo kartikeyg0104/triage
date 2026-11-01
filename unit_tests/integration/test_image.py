@@ -75,7 +75,7 @@ def test_check_reports_revision_of_a_mounted_git_checkout(tmp_path):
 @pytest.fixture
 def server():
     proc = docker("run", "-d", "--rm", "--read-only", "--tmpfs", "/tmp", "-p", "127.0.0.1::8080",
-                  "-v", f"{EXAMPLES}:/examples:ro", "--entrypoint", "python", IMAGE,
+                  "-v", f"{EXAMPLES}:/examples:ro", "-e", f"CLAIMCHECK_API_TOKEN={TOKEN}", "--entrypoint", "python", IMAGE,
                   "-m", "claimcheck.server", "--db", "/tmp/claimcheck.db", "--repo-root", "/examples",
                   "--host", "0.0.0.0", "--port", "8080")
     assert proc.returncode == 0, proc.stderr
@@ -87,9 +87,13 @@ def server():
         docker("rm", "-f", container)
 
 
+TOKEN = "smoke-test-token"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
 def get(url):
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=AUTH), timeout=5) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
@@ -97,7 +101,7 @@ def get(url):
 
 def post_json(url, body):
     request = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", **AUTH})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, json.loads(response.read())
