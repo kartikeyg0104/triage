@@ -17,7 +17,7 @@ from .. import report
 from ..cli import run_check
 from . import auth, dashboard, webhook
 from .paths import inside_root
-from .store import Store
+from .store import Store, WebhookLimitExceeded
 
 MAX_BODY = 1024 * 1024
 
@@ -66,9 +66,13 @@ def unauthorized(kind: str):
 
 
 def create_app(db_path: Path, repo_root: Path, webhook_secret: str, max_body: int = MAX_BODY,
-               api_token: str = "") -> FastAPI:
+               api_token: str = "", *, webhook_max_pending: int | None = None,
+               webhook_max_per_minute: int | None = None) -> FastAPI:
     """With `api_token`, the investigations API and the dashboard need `Authorization: Bearer <api_token>`.
     Without it they are open: the entry point only allows that on a loopback host."""
+    max_pending = webhook.intake_limit(webhook_max_pending, "CLAIMCHECK_WEBHOOK_MAX_PENDING", webhook.MAX_PENDING)
+    max_per_minute = webhook.intake_limit(webhook_max_per_minute, "CLAIMCHECK_WEBHOOK_MAX_PER_MINUTE",
+                                         webhook.MAX_PER_MINUTE)
     app = FastAPI(title="claimcheck")
     store = Store(db_path)
     root = repo_root.resolve()
@@ -118,8 +122,12 @@ def create_app(db_path: Path, repo_root: Path, webhook_secret: str, max_body: in
             parsed = webhook.parse_event(event, json.loads(body))
         except ValueError as error:  # includes JSONDecodeError and UnicodeDecodeError
             raise HTTPException(400, f"malformed {event} payload: {error}") from None
-        investigation, created = await run_in_threadpool(store.create, parsed.source, "received", parsed.request(),
-                                                         delivery_id=delivery)
+        try:
+            investigation, created = await run_in_threadpool(store.create, parsed.source, "received", parsed.request(),
+                                                             delivery_id=delivery, max_pending=max_pending,
+                                                             max_per_minute=max_per_minute)
+        except WebhookLimitExceeded as error:
+            raise HTTPException(429, str(error)) from None
         return {"id": investigation.id, "status": investigation.status, "duplicate": not created}
 
     app.include_router(dashboard.router(store))
