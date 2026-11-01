@@ -13,9 +13,10 @@ TRUNCATION_NOTE = (f"Report truncated to {MAX_REPORT_CHARS // 1024} KiB before t
                    "claims after the cut were found by regex only")
 
 
-def _markdown_cell(text: str) -> str:
-    """Keep untrusted text from creating table columns, rows or code spans."""
-    return " ".join(text.splitlines()).replace("\\", "\\\\").replace("|", "\\|").replace("`", "'")
+def _markdown_cell(text: str, code: bool = False) -> str:
+    """Keep untrusted text from creating table columns or rows; inside a code span, also from closing it."""
+    cell = " ".join(text.splitlines()).replace("\\", "\\\\").replace("|", "\\|")
+    return cell.replace("`", "'") if code else cell
 
 
 def to_markdown(verdict: Verdict, model: str | None) -> str:
@@ -27,7 +28,7 @@ def to_markdown(verdict: Verdict, model: str | None) -> str:
     lines += ["", "| | Claim | Evidence | Basis | Source |", "|---|---|---|---|---|"]
     for e in verdict.evidence:
         lines.append(f"| {ICON[e.status]} {e.status.value} | {_markdown_cell(e.claim.text)} | "
-                     f"{_markdown_cell(e.detail)} | {_markdown_cell(e.basis)} | `{_markdown_cell(e.source)}` |")
+                     f"{_markdown_cell(e.detail)} | {_markdown_cell(e.basis)} | `{_markdown_cell(e.source, code=True)}` |")
     if not verdict.evidence:
         lines.append("| | no checkable claims found | | | |")
     return "\n".join(lines) + "\n"

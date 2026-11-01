@@ -14,7 +14,8 @@ def table_rows(markdown: str, count: int = 1) -> list[str]:
     assert len(rows) == count
     for row in rows:
         assert sum(len(slashes) % 2 == 0 for slashes in re.findall(r"(\\*)\|", row)) == 6
-        assert row.count("`") == 2
+        # Only the source cell is a code span; its text can never close it early.
+        assert row.rsplit(" | ", 1)[1].count("`") == 2
     return rows
 
 
@@ -35,7 +36,8 @@ def test_hostile_text_stays_in_one_cell(field: str, text: str, escaped: str) -> 
     evidence = Evidence(Claim("symbol", values["claim"]), Status.UNVERIFIED,
                         values["detail"], values["source"], values["basis"])
     markdown = report.to_markdown(Verdict([evidence]), None)
-    values[field] = escaped
+    # Backticks are only neutralised inside the source code span; elsewhere inline code is fine.
+    values[field] = escaped if field == "source" or "`" not in text else text
     assert table_rows(markdown) == [
         f"| ! unverified | {values['claim']} | {values['detail']} | {values['basis']} | `{values['source']}` |"
     ]
