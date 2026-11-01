@@ -3,7 +3,10 @@
 Checks recorded webhook events. It claims `received` investigations, runs the static checks
 (regex extractor, no model, no repro) against the local checkout mapped to the event's GitHub
 repo, and stores the result. Nothing from the event text is executed and nothing is fetched
-from GitHub. Any number of workers can share one SQLite file: each row is claimed by one.
+from the repository on GitHub. Any number of workers can share one SQLite file: each row is claimed by one.
+
+With CLAIMCHECK_GITHUB_TOKEN set, a completed check's markdown evidence is posted as one comment on
+the source issue or PR (updated in place on later checks); CLAIMCHECK_GITHUB_API overrides the API URL.
 """
 
 import argparse
@@ -18,6 +21,8 @@ from pathlib import Path
 
 from .. import report
 from ..cli import run_check
+from . import github_client
+from .github_client import CommentWriter
 from .paths import inside_root
 from .store import Investigation, Store
 
@@ -73,33 +78,52 @@ def investigate(request: dict, root: Path, repos: dict[str, Path], check=run_che
         return "failed", None, f"{type(error).__name__}: {error}"
 
 
+def write_back(store: Store, done: Investigation, worker_id: str, writeback: CommentWriter) -> None:
+    """Post or update the comment for a completed row; any failure is recorded on the row, never raised."""
+    try:
+        outcome, error = writeback.post(done.source, github_client.result_markdown(done.result)), None
+    except Exception as failure:  # GitHubError messages are already free of the token
+        outcome, error = "error", str(failure) if isinstance(failure, github_client.GitHubError) \
+            else f"write-back failed: {type(failure).__name__}"
+    store.set_writeback(done.id, worker_id, outcome, error)
+
+
 def process_one(store: Store, root: Path, repos: dict[str, Path], worker_id: str,
-                stale_after: float = DEFAULT_STALE_AFTER, check=run_check) -> Investigation | None:
-    """Claim one row, check it and store the outcome; None when there is nothing to do."""
-    claimed = store.claim(worker_id, stale_after, MAX_ATTEMPTS)
+                stale_after: float = DEFAULT_STALE_AFTER, check=run_check,
+                writeback: CommentWriter | None = None) -> Investigation | None:
+    """Claim one row, check it and store the outcome; None when there is nothing to do. With a
+    `writeback`, a completed row's evidence is then posted to its GitHub issue or PR."""
+    claimed = store.claim(worker_id, stale_after, MAX_ATTEMPTS, writeback=writeback is not None)
     if claimed is None:
         return None
     status, result, error = investigate(claimed.request, root.resolve(), repos, check)
-    store.finish(claimed.id, worker_id, status, result, error)
-    return store.get(claimed.id)
+    finished = store.finish(claimed.id, worker_id, status, result, error)
+    done = store.get(claimed.id)
+    if finished and writeback is not None and status == "completed":
+        write_back(store, done, worker_id, writeback)
+        done = store.get(claimed.id)
+    return done
 
 
 def run(store: Store, root: Path, repos: dict[str, Path], worker_id: str, *, once: bool = False,
         poll: float = DEFAULT_POLL, stale_after: float = DEFAULT_STALE_AFTER, stop: threading.Event | None = None,
-        log: Callable[[str], None] = _print_line) -> int:
+        log: Callable[[str], None] = _print_line, writeback: CommentWriter | None = None) -> int:
     """Process rows until the queue is empty (`once`) or `stop` is set, logging one JSON line per
     row. A row in progress is always finished first. Returns how many rows were processed."""
     stop = stop or threading.Event()
     processed = 0
     while not stop.is_set():
-        done = process_one(store, root, repos, worker_id, stale_after)
+        done = process_one(store, root, repos, worker_id, stale_after, writeback=writeback)
         if done is None:
             if once:
                 break
             stop.wait(poll)
             continue
         processed += 1
-        log(json.dumps({"id": done.id, "status": done.status, "worker": done.worker}))
+        line = {"id": done.id, "status": done.status, "worker": done.worker}
+        if done.writeback is not None:
+            line["writeback"] = done.writeback
+        log(json.dumps(line))
     return processed
 
 
@@ -127,12 +151,18 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    try:
+        writeback = github_client.from_env(os.environ)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     stop = threading.Event()
     previous = {sig: signal.signal(sig, lambda *_: stop.set()) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
-        print(f"worker {args.worker_id}: {len(repos)} repo(s) mapped", file=sys.stderr)
+        comments = "GitHub comments enabled" if writeback else "no GitHub comments (CLAIMCHECK_GITHUB_TOKEN unset)"
+        print(f"worker {args.worker_id}: {len(repos)} repo(s) mapped, {comments}", file=sys.stderr)
         run(Store(args.db), args.repo_root, repos, args.worker_id, once=args.once, poll=args.poll,
-            stale_after=args.stale_after, stop=stop)
+            stale_after=args.stale_after, stop=stop, writeback=writeback)
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
