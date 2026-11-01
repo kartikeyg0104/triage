@@ -65,7 +65,7 @@ def assert_secure(response) -> None:
     assert directives["default-src"] == ["'none'"]
     assert "script-src" not in directives  # falls back to default-src 'none': no script at all
     assert directives["frame-ancestors"] == ["'none'"]
-    assert directives["form-action"] == ["'none'"]
+    assert directives["form-action"] == ["'self'"]  # only the GET search form; every route is GET
     assert directives["base-uri"] == ["'none'"]
     assert "'unsafe-inline'" not in csp
     # The one inline <style> block is allowed by its hash, and by nothing else.
@@ -102,6 +102,11 @@ def client(root, db):
 def set_created(db: Path, investigation_id: str, created_at: str) -> None:
     with closing(sqlite3.connect(db)) as conn, conn:
         conn.execute("UPDATE investigations SET created_at = ? WHERE id = ?", (created_at, investigation_id))
+
+
+def external_links(html: str) -> list[str]:
+    """Links that leave the dashboard; the sidebar and filters only ever link inside it."""
+    return [h for h in re.findall(r'<a\b[^>]*href="([^"]*)"', html) if not h.startswith("/")]
 
 
 def hostile_result() -> dict:
@@ -240,7 +245,7 @@ def test_detail_links_webhook_source_and_shows_short_tested_revision(client, sto
     assert f'<code title="{revision}">{revision[:7]}</code>' in response.text
     href = f"https://github.com/Octo-1/widget.repo_2/{route}/12"
     assert f'<a href="{href}" rel="noopener noreferrer">{source}</a>' in response.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', response.text) == ["/dashboard", href]
+    assert external_links(response.text) == [href]
 
 
 def test_detail_api_without_github_source_shows_short_tested_revision(client, monkeypatch):
@@ -255,7 +260,7 @@ def test_detail_api_without_github_source_shows_short_tested_revision(client, mo
     assert_secure(detail)
     assert_inert(detail.text)
     assert f'<code title="{revision}">{revision[:7]}</code>' in detail.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', detail.text) == ["/dashboard"]
+    assert external_links(detail.text) == []
 
 
 @pytest.mark.parametrize("source", [
@@ -276,7 +281,7 @@ def test_detail_rejects_malformed_github_source_and_escapes_it(client, store, so
     assert response.status_code == 200
     assert_secure(response)
     assert f"<dt>Source</dt><dd>{dashboard.e(source)}</dd>" in response.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', response.text) == ["/dashboard"]
+    assert external_links(response.text) == []
     assert "<script" not in response.text and "<img" not in response.text
 
 
@@ -393,11 +398,13 @@ def test_dashboard_is_read_only(client, method, path):
     assert client.request(method, path).status_code == 405
 
 
-def test_pages_have_no_forms_scripts_or_external_resources(client, store):
+def test_pages_have_no_scripts_external_resources_or_writing_forms(client, store):
     investigation, _ = store.create("api", "completed", {}, hostile_result())
     for path in ("/", "/dashboard", f"/dashboard/investigations/{investigation.id}"):
         page = client.get(path).text.lower()
-        assert "<form" not in page and "<script" not in page and "<link" not in page
+        assert "<script" not in page and "<link" not in page and 'method="post"' not in page
+        # The only form is the GET search, which reads and never changes anything.
+        assert re.findall(r"<form\b[^>]*>", page) in ([], ['<form class="search" method="get" action="/dashboard" role="search">'])
         assert "http://" not in page and "https://" not in page
 
 
@@ -495,7 +502,7 @@ def test_live_api_investigation_with_hostile_report_renders_escaped(live):
     assert_inert(detail.text)
     assert "parse_url is defined" in detail.text
     assert '<dt>Revision</dt><dd><span class="muted">-</span></dd>' in detail.text
-    assert re.findall(r'<a\b[^>]*href="([^"]*)"', detail.text) == ["/dashboard"]
+    assert external_links(detail.text) == []
 
     home = LiveResponse(*fetch(live, "/"))
     assert_secure(home)
