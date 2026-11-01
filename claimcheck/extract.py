@@ -25,6 +25,66 @@ DEFAULT_HOST = "http://localhost:11434"
 OLLAMA_URL = DEFAULT_HOST + "/api/generate"  # the default endpoint; ollama_base_url() applies OLLAMA_HOST
 MAX_REPORT_CHARS = 16 * 1024  # the model sees at most this much of a report
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_QUOTED = re.compile(
+    r'(?P<fence>`{3,}|~{3,})[^\n]*\n.*?(?P=fence)'
+    r'|"(?:\\.|[^"\\])*"'
+    r"|(?<![A-Za-z0-9_])'(?:\\.|[^'\\])*'"
+    r'|(?P<ticks>`+).*?(?P=ticks)', re.DOTALL)
+_ERROR_START = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Fault)|ERROR|Error|Exception|Warning|error)\s*:")
+_ERROR_CONTEXT = re.compile(
+    r"(?:\b(?:fails?|failed|raises?|raised)\s+with|\b(?:expected\s+(?:error(?:\s+text)?|output)"
+    r"|error(?:\s+(?:message|text))?)\s*:?)\s*$", re.IGNORECASE)
+
+
+def _blank(text: str) -> str:
+    """Keep boundaries so removing diagnostic text cannot join identifiers."""
+    return re.sub(r"[^\r\n]", " ", text)
+
+
+def _symbol_text(report: str, expected_error: str = "") -> str:
+    """Error output is evidence for a repro, not a claim about repository symbols."""
+    if expected_error:
+        report = report.replace(expected_error, _blank(expected_error))
+
+    def quoted(match: re.Match[str]) -> str:
+        text = match.group()
+        if match.group("fence"):
+            lines = text.splitlines(keepends=True)
+            diagnostic = any(_ERROR_START.match(line) for line in lines[1:-1])
+            if diagnostic:
+                return "".join(_blank(line) if _ERROR_START.match(line) else line for line in lines)
+        else:
+            width = len(match.group("ticks") or text[0])
+            if _ERROR_START.match(text[width:-width]):
+                return _blank(text)
+        if _ERROR_CONTEXT.search(report[:match.start()]):
+            return _blank(text)
+        return text
+
+    report = _QUOTED.sub(quoted, report)
+    lines = []
+    expected_level = 0
+    fence = ""
+    for line in report.splitlines(keepends=True):
+        stripped = line.strip()
+        opener = re.match(r"(`{3,}|~{3,})", stripped)
+        heading = re.match(r"(#{1,6})\s+(.+?)\s*#*\s*$", stripped) if not fence else None
+        if heading:
+            level, label = len(heading[1]), heading[2].lower()
+            if expected_level and level <= expected_level:
+                expected_level = 0
+            if label in ("expected error", "expected error text"):
+                expected_level = level
+        if fence:
+            if stripped.startswith(fence) and not stripped.strip(fence[0]):
+                fence = ""
+        elif opener:
+            fence = opener[1]
+        expected_line = re.match(r"\s*expected\s+error(?:\s+text)?\s*:", line, re.IGNORECASE)
+        lines.append(_blank(line) if expected_level or expected_line else line)
+    return "".join(lines)
+
 
 PROMPT = """You read a bug, security or pull request report and list what can be checked.
 Reply with JSON only, in this shape:
@@ -182,13 +242,16 @@ def parse_model_output(raw: str, report: str, model: str = MODEL) -> Extraction 
         return None
     if not isinstance(data, dict):
         return None
-    symbols = [s for s in _clean_symbols(data.get("symbols")) if _is_word_in(s, report) and _marked_as_code(s, report)]
     command = str(data.get("repro_command") or "").strip()
     expected = str(data.get("expected_error") or "").strip()
+    expected = expected if expected in report else ""
+    symbol_text = _symbol_text(report, expected)
+    symbols = [s for s in _clean_symbols(data.get("symbols"))
+               if _is_word_in(s, symbol_text) and _marked_as_code(s, symbol_text)]
     return Extraction(
         claims=[Claim("symbol", f"{s}() exists", s) for s in symbols],
         repro_command=command if command in report else "",
-        expected_error=expected if expected in report else "",
+        expected_error=expected,
         model=model,
     )
 
@@ -214,8 +277,9 @@ def _marked_as_code(name: str, report: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9_]){escaped}\(\)|`{escaped}(\(\))?`", report) is not None
 
 
-def regex_extract(report: str) -> Extraction:
+def regex_extract(report: str, expected_error: str = "") -> Extraction:
     """No model: find `name()` calls and backticked names that look like code."""
+    report = _symbol_text(report, expected_error)
     names = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)\(\)`?", report)
     names += [n for n in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", report) if _looks_like_code(n)]
     return Extraction(claims=[Claim("symbol", f"{s}() exists", s) for s in _clean_symbols(names)])
@@ -260,5 +324,5 @@ def extract_claims(report: str, generate=None, model: str | None = None) -> Extr
     extraction.truncated = len(seen) < len(report)
     # A small model can miss names that literally appear as `name()`; add those.
     known = {c.target for c in extraction.claims}
-    extraction.claims += [c for c in regex_extract(report).claims if c.target not in known]
+    extraction.claims += [c for c in regex_extract(report, extraction.expected_error).claims if c.target not in known]
     return extraction
