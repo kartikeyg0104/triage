@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "source": "python -m claimcheck.evaluate --runs 2 --json on 2026-11-01, revision b2b0045 (sandbox-exec, Python 3.14.7): 19 cases, 19 scored, claims 41/41, verdicts 19/19, wrong confirmed 0, wrong refuted 0",
-  "cases": 19,
-  "scored": 19,
+  "source": "python -m claimcheck.evaluate --runs 3 --json on 2026-11-01 (sandbox-exec, Python 3.14.7): 27 cases, 27 scored, claims 68/69, verdicts 27/27, wrong confirmed 0, wrong refuted 0; the one claim miss is the known extra `max()` claim in case 26",
+  "cases": 27,
+  "scored": 27,
   "verdict_accuracy": 1.0,
-  "claim_accuracy": 1.0
+  "claim_accuracy": 0.9855
 }

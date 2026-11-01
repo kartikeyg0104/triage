@@ -15,7 +15,7 @@ EXAMPLES = ROOT / "examples"
 
 
 def normalise(text: str) -> str:
-    text = re.sub(r"\b(sandbox-exec|unshare-net): ", "SANDBOX: ", text)
+    text = re.sub(r"\b(sandbox-exec|unshare-net|bwrap): ", "SANDBOX: ", text)
     text = re.sub(r"Tested revision: .*", "Tested revision: REV", text)
     text = re.sub(r"\b[0-9a-f]{40}\b", "SHA", text)
     return re.sub(r"\b[0-9a-f]{12}\b", "SHA", text)

@@ -1,0 +1,5 @@
+This looks flaky in CI: the job log sometimes shows only block sizes, but an interactive
+rerun shows a checksum error. verify_blocks() rejects archives that contain an empty block.
+`python3 poc.py` prints the
+block sizes and then exits 3 with "checksum mismatch in block 1" (on stderr, so it is easy to
+miss if you only look at stdout).

@@ -1,0 +1,4 @@
+Bug: inventory.io.readers.read_stock_rows() drops the last line of every file, so
+inventory.core.totals.total_quantity() comes out short. The rows come back as `StockRow`
+objects; the last one is simply missing. reporting.summary.build_summary() imports the
+inventory helpers and also undercounts. Both packages live in this repo. Seen on 0.4.1.

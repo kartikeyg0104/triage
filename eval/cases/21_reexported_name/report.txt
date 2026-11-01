@@ -1,0 +1,3 @@
+`tomlette.parse()` keeps a UTF-8 byte order mark in the first key: parsing "﻿title = x"
+gives {"﻿title": "x"} instead of {"title": "x"}. I call parse() from the package root, as
+the README says.

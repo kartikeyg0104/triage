@@ -1,0 +1,3 @@
+HeaderParser.parse_header() raises ValueError on a header line with no colon instead of
+skipping it, so `HeaderParser.from_lines()` fails for the whole block when one line is bad.
+HeaderParser.validate() should catch this first but never runs.

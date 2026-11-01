@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Allow unprivileged network namespaces (needed by the sandbox tests)
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Install
@@ -83,10 +85,10 @@ jobs:
       - name: Service answers 404 for an unknown investigation
         run: |
           docker run -d --name claimcheck-server --read-only --tmpfs /tmp -p 127.0.0.1:8080:8080 \
-            -v "$PWD/examples:/examples:ro" --entrypoint python "$IMAGE" \
+            -v "$PWD/examples:/examples:ro" -e CLAIMCHECK_API_TOKEN=smoke-test-token --entrypoint python "$IMAGE" \
             -m claimcheck.server --db /tmp/claimcheck.db --repo-root /examples --host 0.0.0.0 --port 8080
           for _ in $(seq 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/investigations/does-not-exist || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer smoke-test-token' localhost:8080/v1/investigations/does-not-exist || true)
             [ "$code" != "000" ] && break
             sleep 1
           done

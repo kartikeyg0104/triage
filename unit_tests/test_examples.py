@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def normalise(text: str) -> str:
-    text = re.sub(r"`(sandbox-exec|unshare-net): ", "`SANDBOX: ", text)
+    text = re.sub(r"`(sandbox-exec|unshare-net|bwrap): ", "`SANDBOX: ", text)
     return re.sub(r"Tested revision: .*", "Tested revision: REV", text)
 
 

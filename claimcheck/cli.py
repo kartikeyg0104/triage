@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from . import checks, extract, k8s, report, revisions, sandbox
-from .models import Verdict
+from .models import Claim, Evidence, Status, Verdict
 
 
 def git_revision(repo: Path) -> str:
@@ -18,11 +18,20 @@ def git_revision(repo: Path) -> str:
 
 
 def run_check(repo: Path, report_text: str, diff: str | None, repro: str | None, expect: str, use_model: bool,
-              run_repro=sandbox.run_repro, base: str | None = None, head: str | None = None):
-    extraction = extract.extract_claims(report_text) if use_model else extract.regex_extract(report_text)
+              run_repro=sandbox.run_repro, base: str | None = None, head: str | None = None,
+              model_name: str | None = None):
+    if not use_model:
+        extraction = extract.regex_extract(report_text)
+    elif model_name:
+        extraction = extract.extract_claims(report_text, model=model_name)
+    else:
+        extraction = extract.extract_claims(report_text)
     verdict = Verdict(revision=git_revision(repo), report_truncated=extraction.truncated)
     for claim in extraction.claims:
         verdict.evidence.append(checks.check_symbol(repo, claim.target))
+    if extraction.note:
+        verdict.evidence.append(Evidence(Claim("extraction", "Model claim extraction was available"),
+                                         Status.UNVERIFIED, extraction.note))
     if diff is not None:
         verdict.evidence.append(checks.check_pr_tests(diff))
     if repro and base is not None and head is not None:
@@ -47,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--sarif", type=Path, metavar="PATH",
                        help="also write a SARIF 2.1.0 file (e.g. for GitHub code scanning); stdout is unchanged")
     check.add_argument("--no-model", action="store_true", help="skip the model, use the regex extractor")
+    check.add_argument("--model-name", metavar="NAME",
+                       help=f"Ollama model to extract claims with (default: $CLAIMCHECK_MODEL, else {extract.MODEL}); "
+                            "the server comes from $OLLAMA_HOST")
     check.add_argument("--executor", choices=["local", "kubernetes"], default="local",
                        help="where the repro runs: a local no-network process, or a locked-down Kubernetes Job")
     check.add_argument("--k8s-namespace", default="claimcheck")
@@ -77,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
                                            runtime_class=args.k8s_runtime_class, context=args.kube_context,
                                            impersonate=args.k8s_impersonate).run_repro
     verdict, model = run_check(args.repo, args.report.read_text(), diff, args.repro, args.expect, not args.no_model,
-                               run_repro, base=args.base, head=args.head)
+                               run_repro, base=args.base, head=args.head, model_name=args.model_name)
     print((report.to_json if args.json else report.to_markdown)(verdict, model), end="")
     if args.sarif:
         args.sarif.write_text(report.to_sarif(verdict, model))

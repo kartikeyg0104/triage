@@ -1,0 +1,4 @@
+`LruCache` evicts the most recently used key instead of the oldest once it is full, and
+memoize() caches by reference so two equal arrays miss. mapValues() drops symbol keys.
+`InMemoryRepo` findById() returns a `Result` with ok: true for a missing id, and evictAll()
+does nothing at all.
