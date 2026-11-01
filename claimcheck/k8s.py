@@ -29,6 +29,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -227,6 +228,7 @@ class KubernetesExecutor:
         self.context, self.deadline, self.poll_interval, self._run = context, deadline, poll_interval, run
         self.require_network_isolation, self.impersonate = require_network_isolation, impersonate
         self._isolated: bool | None = None
+        self._probe_lock = threading.Lock()  # base and head may call run_repro concurrently
         self._probe_denied: RBACDenied | AdmissionDenied | None = None
 
     def _kubectl(self, verb: str, *args: str, input: str | None = None) -> subprocess.CompletedProcess:
@@ -270,6 +272,10 @@ class KubernetesExecutor:
 
     def network_isolated(self) -> bool:
         """Run the probe once under a deny-all policy. Setup refusals are cached too."""
+        with self._probe_lock:
+            return self._network_isolated_locked()
+
+    def _network_isolated_locked(self) -> bool:
         if self._isolated is None and self._probe_denied is None:
             with tempfile.TemporaryDirectory(prefix="claimcheck-probe-") as probe_dir:
                 Path(probe_dir, "probe.py").write_text(PROBE_SCRIPT)
