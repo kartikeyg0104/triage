@@ -31,6 +31,8 @@ SECRET = "s3cret"
 SCRIPT = "<script>alert(1)</script>"
 IMG = '"><img src=x onerror=alert(2)>'
 HOSTILE = f"{SCRIPT} {IMG} RCE in parse_url_v2() and `parse_url()`"
+PICO_PATH = "/dashboard/static/pico.min.css"
+PICO_FILE = Path(dashboard.__file__).parent / "static" / "pico.min.css"
 SECURITY_HEADERS = {
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
@@ -68,11 +70,12 @@ def assert_secure(response) -> None:
     assert directives["form-action"] == ["'none'"]
     assert directives["base-uri"] == ["'none'"]
     assert "'unsafe-inline'" not in csp
-    # The one inline <style> block is allowed by its hash, and by nothing else.
+    # Styles: the vendored Pico stylesheet from this origin, plus the one inline <style> block by its hash.
     styles = re.findall(r"<style>(.*?)</style>", response.text, re.S)
     assert len(styles) == 1
     digest = base64.b64encode(hashlib.sha256(styles[0].encode()).digest()).decode()
-    assert directives["style-src"] == [f"'sha256-{digest}'"]
+    assert directives["style-src"] == ["'self'", f"'sha256-{digest}'"]
+    assert re.findall(r"<link[^>]*>", response.text) == [f'<link rel="stylesheet" href="{PICO_PATH}">']
     assert " style=" not in response.text  # inline style attributes would be blocked anyway
 
 
@@ -397,8 +400,80 @@ def test_pages_have_no_forms_scripts_or_external_resources(client, store):
     investigation, _ = store.create("api", "completed", {}, hostile_result())
     for path in ("/", "/dashboard", f"/dashboard/investigations/{investigation.id}"):
         page = client.get(path).text.lower()
-        assert "<form" not in page and "<script" not in page and "<link" not in page
+        assert "<form" not in page and "<script" not in page
+        assert re.findall(r"<link[^>]*>", page) == [f'<link rel="stylesheet" href="{PICO_PATH}">']
         assert "http://" not in page and "https://" not in page
+
+
+# The vendored Pico CSS stylesheet
+
+
+def test_pico_stylesheet_is_served_from_this_origin(client):
+    response = client.get(PICO_PATH)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/css")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "max-age" in response.headers["cache-control"]
+    assert response.content == PICO_FILE.read_bytes()
+    assert "Pico CSS" in response.text and "Licensed under MIT" in response.text  # banner kept
+
+
+def test_pico_stylesheet_loads_nothing_from_elsewhere():
+    css = PICO_FILE.read_text()
+    assert "@import" not in css
+    # Its only url()s are inline SVG data URIs (form-control icons), never a remote fetch.
+    assert all(u.startswith('"data:') for u in re.findall(r"url\(([^)]{0,6})", css))
+
+
+def test_pico_license_is_shipped_and_packaged():
+    assert "MIT License" in (PICO_FILE.parent / "PICO_LICENSE.md").read_text()
+    pyproject = (Path(dashboard.__file__).parents[2] / "pyproject.toml").read_text()
+    assert '"claimcheck.server" = ["static/*"]' in pyproject
+
+
+@pytest.mark.parametrize("path", ["/dashboard/static/app.py", "/dashboard/static/../app.py",
+                                  "/dashboard/static/%2e%2e/store.py", "/dashboard/static/PICO_LICENSE.md"])
+def test_only_the_stylesheet_is_served_from_static(client, path):
+    assert client.get(path).status_code == 404
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
+def test_stylesheet_route_is_read_only(client, method):
+    assert client.request(method, PICO_PATH).status_code == 405
+
+
+# Layout built on Pico's semantic elements
+
+
+def test_list_page_uses_pico_layout_and_badges(client, store):
+    store.create("api", "completed", {}, {"verdict": "refuted", "evidence": []})
+    page = client.get("/dashboard").text
+    assert '<main class="container">' in page and '<header class="container">' in page
+    assert '<table class="striped">' in page and 'class="overflow-auto"' in page
+    assert '<span class="badge s-completed">completed</span>' in page
+    assert '<span class="badge s-refuted">refuted</span>' in page
+    assert 'aria-current="page"' in page  # the active status filter
+
+
+def test_unknown_status_gets_a_plain_badge(client, store):
+    store.create("api", f"weird{SCRIPT}", {})
+    page = client.get("/dashboard").text
+    assert '<span class="badge">weird&lt;script&gt;' in page
+
+
+def test_detail_page_groups_sections_into_cards(client, store):
+    investigation, _ = store.create("api", "completed", {"repo": "sample", "report": "RCE"}, hostile_result())
+    page = client.get(f"/dashboard/investigations/{investigation.id}").text
+    assert page.count("<article>") == 4  # overview, result, claims, request
+    assert '<span class="badge s-confirmed">confirmed</span>' in page
+    assert '<table class="striped">' in page
+
+
+def test_live_stylesheet_is_served(live):
+    status, headers, text = fetch(live, PICO_PATH)
+    assert status == 200
+    assert LiveResponse(status, headers, text).headers["content-type"].startswith("text/css")
+    assert text == PICO_FILE.read_text()
 
 
 def test_json_api_is_unchanged(client, store):
