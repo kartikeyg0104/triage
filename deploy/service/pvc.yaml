@@ -1,0 +1,12 @@
+# The SQLite database. ReadWriteOnce: only one node can mount it, which is why the API and the
+# worker are two containers of one pod rather than two Deployments (see README.md).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claimcheck-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
