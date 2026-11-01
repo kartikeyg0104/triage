@@ -2,8 +2,10 @@
 
 Isolation is real or the run is refused: if the OS gives us no way to block the network,
 the claim stays UNVERIFIED instead of running untrusted code unprotected. On Linux, bubblewrap
-also hides the host filesystem when installed. The network-only fallback and macOS still
-allow host file reads, so the copy itself must not reach outside the repo (see repo_copy).
+also hides the host filesystem when installed. The macOS profile, named sandbox-exec in the
+evidence, denies home-directory reads except the temporary work directory and its repo copy.
+System paths remain readable; the Linux network-only fallback still allows host file reads.
+The copy itself must not reach outside the repo (see repo_copy).
 
 The repro also runs under resource limits (CPU seconds, file size, open files, processes and,
 where the OS honours it, address space), so it cannot fork-bomb, eat memory or fill the disk.
@@ -24,7 +26,20 @@ from pathlib import Path
 from .models import Claim, Evidence, Status
 from .repo_copy import RepoTooLarge, copy_repo, describe_skipped
 
-_MAC_PROFILE = "(version 1)(allow default)(deny network*)"
+_MAC_PROFILE = """; sandbox-exec profile
+(version 1)
+(allow default)
+(deny network*)
+(deny file-read* (subpath (param "HOST_HOME")))
+(allow file-read* (subpath (param "WORKDIR")))
+"""
+
+
+def _mac_prefix(workdir: str) -> list[str]:
+    """Pass canonical paths as data so aliases and profile syntax cannot bypass the deny."""
+    return ["sandbox-exec", "-p", _MAC_PROFILE,
+            "-D", f"HOST_HOME={Path.home().resolve()}",
+            "-D", f"WORKDIR={Path(workdir).resolve()}"]
 
 
 def _bwrap_prefix() -> list[str]:
@@ -40,7 +55,7 @@ def detect_isolation() -> tuple[str, list[str]] | None:
     """Probe isolation; an installed but unusable bwrap must not silently expose host files."""
     candidates = []
     if sys.platform == "darwin" and shutil.which("sandbox-exec"):
-        candidates.append(("sandbox-exec", ["sandbox-exec", "-p", _MAC_PROFILE]))
+        candidates.append(("sandbox-exec", _mac_prefix("/dev/null")))
     if sys.platform.startswith("linux"):
         if shutil.which("bwrap"):
             candidates.append(("bwrap", _bwrap_prefix()))
@@ -169,7 +184,9 @@ def run_repro(repo: Path, command: str, expect: str, timeout: int = 30) -> Evide
             return Evidence(claim, Status.UNVERIFIED, str(exc), "sandbox")
         args = prefix + ["sh", "-c", command]
         home = work
-        if name == "bwrap":
+        if name == "sandbox-exec":
+            args = _mac_prefix(work) + ["sh", "-c", command]
+        elif name == "bwrap":
             args = prefix + ["--bind", str(target), "/repo", "--chdir", "/repo", "--", "sh", "-c", command]
             home = "/tmp"
         try:
@@ -225,7 +242,8 @@ def _with_note(evidence: Evidence, note: str) -> Evidence:
 
 
 _SETUP_MARKERS = ("command not found", "ModuleNotFoundError", "ImportError", "Cannot find module",
-                  "No such file or directory", "Permission denied", "not recognized as", "bwrap:")
+                  "No such file or directory", "Permission denied", "PermissionError:",
+                  ": Operation not permitted", "not recognized as", "bwrap:", "sandbox-exec:")
 
 
 def classify(claim: Claim, returncode: int, output: str, expect: str, source: str) -> Evidence:

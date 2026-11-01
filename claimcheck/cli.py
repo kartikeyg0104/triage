@@ -1,4 +1,4 @@
-"""Command line: claimcheck check --repo PATH --report FILE [--diff FILE] [--repro CMD --expect TEXT [--base REF --head REF]]."""
+"""Check claims, or render saved JSON evidence without rerunning the investigation."""
 
 import argparse
 import subprocess
@@ -68,11 +68,22 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--k8s-impersonate", metavar="USER",
                        help="run every kubectl call as USER (kubectl --as), e.g. "
                             "system:serviceaccount:claimcheck:claimcheck-executor from deploy/k8s")
+    render = sub.add_parser("render", help="render a saved JSON report without running checks or commands")
+    render.add_argument("report", type=Path, metavar="REPORT.json")
+    render.add_argument("--format", required=True, choices=["markdown", "sarif"], help="output format on stdout")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "render":
+        try:
+            verdict, model = report.from_json(args.report.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            print(f"error: cannot render report {args.report}: {exc}", file=sys.stderr)
+            return 2
+        print((report.to_markdown if args.format == "markdown" else report.to_sarif)(verdict, model), end="")
+        return report.EXIT_CODE[verdict.outcome]
     if not args.repo.is_dir():
         print(f"error: repo not found: {args.repo}", file=sys.stderr)
         return 2

@@ -16,12 +16,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-from . import report
+from . import report, revisions, sandbox
 from .checks import check_symbol
 from .cli import run_check
 from .extract import _clean_symbols
 from .issue_form import parse_issue_form
-from .models import Evidence, Status, Verdict
+from .models import Claim, Evidence, Status, Verdict
 
 MARKER = "<!-- claimcheck -->"
 API = "https://api.github.com"
@@ -96,6 +96,23 @@ def head_sha(event: dict) -> str | None:
     """The PR head commit from the event payload, only if it is a full hex SHA."""
     sha = ((event.get("pull_request") or {}).get("head") or {}).get("sha")
     return sha if isinstance(sha, str) and SHA.fullmatch(sha) else None
+
+
+def verify_pr_fix(root: Path, event: dict, command: str, expect: str, run_repro: revisions.RunRepro) -> Evidence:
+    """Use only event commit SHAs; missing history is a setup problem, never a verdict on the fix."""
+    base = ((event.get("pull_request") or {}).get("base") or {}).get("sha")
+    head = head_sha(event)
+    claim = Claim("fix", f"the PR head fixes the failure `{command}` shows on the PR base", command)
+    if not isinstance(base, str) or not SHA.fullmatch(base) or not head:
+        return Evidence(claim, Status.UNVERIFIED,
+                        "setup failure: fix verification needs full PR base and head commit SHAs from the event")
+    source = f"base {base[:12]} → head {head[:12]}"
+    for side, sha in (("base", base), ("head", head)):
+        if revisions.resolve(root, sha) != sha:
+            return Evidence(claim, Status.UNVERIFIED,
+                            f"setup failure: {side} {sha[:12]} commit not available, increase fetch-depth "
+                            "(actions/checkout fetch-depth: 0) so both PR commits are present", source)
+    return revisions.verify_fix(root, base, head, command, expect, run_repro)
 
 
 def check_conclusion(outcome: str, fail_on_refuted: bool) -> str:
@@ -204,7 +221,7 @@ def print_untrusted(text: str) -> None:
     print(f"::{token}::")
 
 
-def run(env: dict, http=_request) -> int:
+def run(env: dict, http=_request, run_repro: revisions.RunRepro = sandbox.run_repro) -> int:
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text())
     found = event_text(event)
     if not found:
@@ -214,8 +231,12 @@ def run(env: dict, http=_request) -> int:
     repo_name, token = env["GITHUB_REPOSITORY"], env.get("GITHUB_TOKEN", "")
     diff = fetch_diff(repo_name, number, token, http) if is_pr and token else None
     root = Path(env.get("INPUT_PATH") or ".")
-    verdict, model = run_check(root, text, diff, env.get("INPUT_REPRO") or None,
-                               env.get("INPUT_EXPECT", ""), use_model=False)
+    repro, expect = env.get("INPUT_REPRO") or None, env.get("INPUT_EXPECT", "")
+    verify_fix = env.get("INPUT_VERIFY_FIX") == "true"
+    verdict, model = run_check(root, text, diff, None if verify_fix else repro, expect,
+                               use_model=False, run_repro=run_repro)
+    if verify_fix and repro:
+        verdict.evidence.append(verify_pr_fix(root, event, repro, expect, run_repro))
     suggestion = "" if is_pr else apply_issue_form(event["issue"].get("body"), root, verdict)
     fail_on_refuted = env.get("INPUT_FAIL_ON_REFUTED") == "true"
     markdown = report.to_markdown(verdict, model) + suggestion
