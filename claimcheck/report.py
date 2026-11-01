@@ -13,6 +13,12 @@ TRUNCATION_NOTE = (f"Report truncated to {MAX_REPORT_CHARS // 1024} KiB before t
                    "claims after the cut were found by regex only")
 
 
+def _markdown_cell(text: str, code: bool = False) -> str:
+    """Keep untrusted text from creating table columns or rows; inside a code span, also from closing it."""
+    cell = " ".join(text.splitlines()).replace("\\", "\\\\").replace("|", "\\|")
+    return cell.replace("`", "'") if code else cell
+
+
 def to_markdown(verdict: Verdict, model: str | None) -> str:
     lines = ["# claimcheck report", "", f"**Verdict: {verdict.outcome}**", ""]
     lines.append(f"Claim extraction: {model if model else 'regex fallback (no model used)'}")
@@ -21,7 +27,8 @@ def to_markdown(verdict: Verdict, model: str | None) -> str:
     lines.append(f"Tested revision: {'`' + verdict.revision + '`' if verdict.revision else 'unknown (not a git checkout)'}")
     lines += ["", "| | Claim | Evidence | Basis | Source |", "|---|---|---|---|---|"]
     for e in verdict.evidence:
-        lines.append(f"| {ICON[e.status]} {e.status.value} | {e.claim.text} | {e.detail} | {e.basis} | `{e.source}` |")
+        lines.append(f"| {ICON[e.status]} {e.status.value} | {_markdown_cell(e.claim.text)} | "
+                     f"{_markdown_cell(e.detail)} | {_markdown_cell(e.basis)} | `{_markdown_cell(e.source, code=True)}` |")
     if not verdict.evidence:
         lines.append("| | no checkable claims found | | | |")
     return "\n".join(lines) + "\n"
