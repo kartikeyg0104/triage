@@ -465,12 +465,29 @@ def check_symbol(repo: Path, name: str) -> Evidence:
                     repo.resolve().name, "inferred")
 
 
+def _diff_files(diff: str) -> list[tuple[str, bool]]:
+    """Keep deletion status so removed tests cannot count as test coverage evidence."""
+    files: dict[str, bool] = {}
+    old: str | None = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git ") or line == "--- /dev/null":
+            old = None
+        elif line.startswith("rename from "):
+            old = line[len("rename from "):].strip()
+        elif line.startswith("--- a/"):
+            old = line[len("--- a/"):].strip()
+        elif line.startswith("rename to "):
+            files[line[len("rename to "):].strip()] = False
+        elif line.startswith("+++ b/"):
+            files[line[len("+++ b/"):].strip()] = False
+        elif line == "+++ /dev/null" and old:
+            files.setdefault(old, True)
+    return list(files.items())
+
+
 def changed_files(diff: str) -> list[str]:
-    """File paths touched by a unified diff (the 'b/' side, ignoring deletions)."""
-    files = []
-    for match in re.finditer(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE):
-        files.append(match.group(1).strip())
-    return files
+    """Touched paths, using rename destinations and original paths for deletions."""
+    return [path for path, _ in _diff_files(diff)]
 
 
 def _is_test(path: str) -> bool:
@@ -483,12 +500,12 @@ def _is_test(path: str) -> bool:
 
 
 def check_pr_tests(diff: str) -> Evidence:
-    """Whether the diff touches test files. Not touching them does not show the change is
-    untested: existing tests may already cover it."""
+    """Whether the diff touches surviving test files. Not touching them does not show
+    the change is untested: existing tests may already cover it."""
     claim = Claim("pr_tests", "the PR changes tests alongside its source change")
-    files = changed_files(diff)
-    code = [f for f in files if Path(f).suffix in SOURCE_SUFFIXES and not _is_test(f)]
-    tests = [f for f in files if _is_test(f)]
+    files = _diff_files(diff)
+    code = [f for f, _ in files if Path(f).suffix in SOURCE_SUFFIXES and not _is_test(f)]
+    tests = [f for f, deleted in files if not deleted and _is_test(f)]
     if not code:
         return Evidence(claim, Status.UNVERIFIED, "the diff changes no source files", "diff", "observed")
     if tests:
