@@ -17,6 +17,7 @@ The Role grants exactly what the executor's kubectl calls (`claimcheck/k8s.py`) 
 |---|---|
 | `apply -f -` (ConfigMap, NetworkPolicy, Job) | `get`, `create` on configmaps, networkpolicies, jobs |
 | `get pods -l <run> -o json` | `list` pods |
+| `get events --field-selector involvedObject.kind=Job,involvedObject.name=<run>,reason=FailedCreate -o json` | `get`, `list` core events (read only) |
 | `logs job/<name>` | `get` jobs, `list` pods, `get` pods/log |
 | `delete jobs,configmaps,networkpolicies -l <run> --wait=true` | `list`, `delete`, `watch` on the three |
 
@@ -25,12 +26,18 @@ Not granted: Secrets, creating Pods directly, `pods/exec`, `attach`, `portforwar
 anything cluster-wide. The repro Job's pods are created by the Job controller, so the executor never
 needs `create pods`.
 
+Event access is limited to the core API group in `claimcheck`: exactly `get`, `list`, with no
+`watch` or writes and no access to `events.k8s.io`. The executor lists events filtered to its Job;
+RBAC permits reading all events in the namespace, so that filter is not an access boundary.
+
 ## Running as the ServiceAccount
 
-`KubernetesExecutor(impersonate="system:serviceaccount:claimcheck:claimcheck-executor")` adds
-`--as <user>` to every kubectl call (network probe, apply, poll, logs, cleanup). The caller's own
-context must be allowed to impersonate; kind's admin is. Without impersonation, give the executor a
-kubeconfig with a token for the ServiceAccount:
+The CLI flag `--k8s-impersonate system:serviceaccount:claimcheck:claimcheck-executor` and Python's
+`KubernetesExecutor(impersonate="system:serviceaccount:claimcheck:claimcheck-executor")` add
+`--as <user>` to every kubectl call (network probe, apply, pod and event polling, logs, cleanup).
+Use `--kube-context kind-claimcheck` to select the CLI context. The caller's own context must be
+allowed to impersonate; kind's admin is. Without impersonation, give the executor a kubeconfig
+with a token for the ServiceAccount:
 
 ```bash
 kubectl -n claimcheck create token claimcheck-executor --duration=1h
@@ -38,7 +45,8 @@ kubectl -n claimcheck create token claimcheck-executor --duration=1h
 
 If the executor itself runs in a pod as this ServiceAccount, that pod has to opt in with
 `automountServiceAccountToken: true`, because the ServiceAccount turns it off by default. The CLI
-has no flag for `impersonate` yet; it is available from Python.
+reports RBAC refusals as unverified setup failures naming the denied identity, verb, resource and
+namespace, including refusals during the network probe; they do not confirm or refute the claim.
 
 ## What was tested
 
@@ -54,6 +62,13 @@ runs it with the other integration tests (this was written before the first CI r
   `serviceaccounts/token`, creating Roles/RoleBindings, `patch`/`update`, `deletecollection`, any of
   those resources in `default`, `kube-system` and `claimcheck-it`, and cluster-wide
   namespaces/nodes/ClusterRoleBindings.
+- Core events allow exactly `get`, `list`; `watch` and all writes are denied, as are event reads
+  in other namespaces or across the cluster.
+- A zero-pod quota in a temporary namespace is named as a `ResourceQuota setup failure` during
+  both the network probe and the repro, as the executor ServiceAccount. The test copies the shipped
+  Role there and binds it to that ServiceAccount without changing the shared `claimcheck` quota.
+  It reads real `FailedCreate` events, requires a result in under 15 seconds with a 20-second
+  deadline, keeps the verdict unverified, and checks that the run's objects are cleaned up.
 - A privileged pod, and a pod with default settings (root, capabilities kept), applied with
   `--dry-run=server` as the admin are rejected with `violates PodSecurity "restricted:latest"`, so it
   is admission, not RBAC, that stops them.
@@ -64,18 +79,20 @@ runs it with the other integration tests (this was written before the first CI r
   exists.
 - The Role, RoleBinding and ServiceAccount the cluster really has contain no `*`, no Secrets, no
   exec/attach/port-forward, no `patch`/`update`, and the token is not automounted.
-- Each permission in the Role was removed in turn and a full run repeated, to check it is needed
+- The original pod execution and cleanup permissions were removed in turn and a full run repeated
   (a one-off check, not part of the test suite); see "Why each permission is there" below.
 
-`unit_tests/test_k8s.py` checks the manifest files too, without a cluster: no `*`, no Secrets, no
-exec/attach/port-forward, no RBAC or token resources, no ClusterRole, and exactly the rule set
-above. Those tests need PyYAML and skip without it (CI's unit job does not install it, so there the
-cluster tests are the check).
+`unit_tests/test_k8s.py` checks the manifest restrictions without a cluster: no `*`, no Secrets,
+no exec/attach/port-forward, no RBAC or token resources, and no ClusterRole.
+`unit_tests/test_k8s_manifests.py` asserts the complete rule set above, including
+exactly `get`, `list` on core events in `claimcheck`. Those tests need PyYAML and skip without it;
+the cluster tests also check the live Role and effective permissions.
 
 ## Why each permission is there
 
-Checked on kind (v1.36) by removing one verb at a time from the Role and repeating a full run as the
-ServiceAccount (probe, then repro), then checking for leftover objects:
+The original pod execution and cleanup permissions were checked on kind (v1.36) by removing one
+verb at a time and repeating a full run as the ServiceAccount (probe, then repro), then checking
+for leftover objects:
 
 | Removed | Result |
 |---|---|
@@ -88,6 +105,10 @@ ServiceAccount (probe, then repro), then checking for leftover objects:
 `patch` is only used by `kubectl apply` when the object already exists. Every run uses fresh
 names, so apply always creates. If you change the executor to re-apply objects, the Role must gain
 `patch`.
+
+Event access is checked by the quota-denial regression tests above. Listing core events lets the
+executor read the Job controller's admission denial while it waits for a pod; `get` also permits
+reading an individual event. Without `list`, that denial can degrade to a pod timeout.
 
 ## ResourceQuota and LimitRange
 
@@ -116,9 +137,13 @@ and is counted against the quota (a quota on `requests.*`/`limits.*` otherwise r
 numbers together (N x the per-pod values) if you need more concurrent runs. The ServiceAccount
 cannot create, update, patch or delete ResourceQuotas or LimitRanges, so it cannot lift its own caps.
 
-When the quota is full the executor's Job is still created, but the Job controller is refused the
-pod (`FailedCreate ... exceeded quota`); the executor keeps polling and then reports the run as
-unverified ("the pod did not finish in time"). It does not name the quota as the cause.
+When a Job or ConfigMap exceeds quota at apply, the executor reports the admission denial directly.
+When a pod exceeds quota, the Job can still be created, but the Job controller is refused the pod
+(`FailedCreate ... exceeded quota`). The executor reads that Job event and promptly reports an
+unverified `ResourceQuota setup failure` naming the quota and exceeded resource. LimitRange
+admission denials are likewise named as setup failures, including during the network probe.
+If event access is denied or events are unavailable, pod polling still works, but an admission
+denial may fall back to a timeout.
 
 Tested by `unit_tests/integration/test_k8s_quota.py` on kind (v1.36, Calico): a run as the
 ServiceAccount is confirmed under the quota, and so are four runs at the same time (the Role needs
@@ -141,10 +166,8 @@ and 10 pods (never scheduled) are created and the 11th of each is rejected (`exc
 - **The executor can create NetworkPolicies.** NetworkPolicies are additive, so whoever holds the
   executor's identity could add one that allows egress. The probe pod checks the deny-all policy
   before the first run; it does not watch for later policies.
-- If RBAC refuses the probe pod (wrong namespace, missing Role), the report says the probe "could
-  not run" under the NetworkPolicy message; it does not name RBAC as the cause.
 - The quota caps the namespace, not one caller: a single client that starts 10 runs can use all of
-  it, and other runs then wait until their deadline. NetworkPolicies and ephemeral storage are not
+  it, and other runs can be denied admission. NetworkPolicies and ephemeral storage are not
   in the quota (each pod's emptyDirs have a `sizeLimit`).
 - Pod Security `latest` follows the cluster's version; pin `enforce-version` if you need the policy
   to stay fixed across upgrades.
