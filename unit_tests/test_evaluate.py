@@ -14,7 +14,6 @@ CASE_NAMES = sorted(p.name for p in CASES.iterdir() if p.is_dir()) if CASES.is_d
 # Cases the tool gets wrong today. Only misses that leave a claim unverified may be listed here:
 # a wrong confirmed or wrong refuted answer must fail.
 KNOWN_MISSES: dict[str, str] = {
-    "26_repro_missing_dependency": "the quoted error text `max()` is extracted as an extra symbol claim (comes back unverified, never refuted)",
 }
 
 
