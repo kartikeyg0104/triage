@@ -46,10 +46,74 @@ def test_existing_symbol_is_confirmed_with_location(tmp_path):
 
 DIFF_NO_TEST = "--- a/cli.py\n+++ b/cli.py\n@@ -1 +1 @@\n-a\n+b\n"
 DIFF_WITH_TEST = DIFF_NO_TEST + "--- a/tests/test_cli.py\n+++ b/tests/test_cli.py\n@@ -1 +1 @@\n-a\n+b\n"
+DIFF_RENAME = (
+    "diff --git a/cli.py b/main.py\nsimilarity index 100%\n"
+    "rename from cli.py\nrename to main.py\n"
+)
+DIFF_DELETE_TEST = (
+    "diff --git a/tests/test_cli.py b/tests/test_cli.py\ndeleted file mode 100644\n"
+    "--- a/tests/test_cli.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n"
+)
+DIFF_RENAME_TEST = (
+    "diff --git a/tests/test_old.py b/tests/test_new.py\nsimilarity index 90%\n"
+    "rename from tests/test_old.py\nrename to tests/test_new.py\n"
+    "--- a/tests/test_old.py\n+++ b/tests/test_new.py\n@@ -1 +1 @@\n-a\n+b\n"
+)
+DIFF_ADD_TEST = "--- /dev/null\n+++ b/tests/test_added.py\n@@ -0,0 +1 @@\n+a\n"
 
 
 def test_changed_files_parses_diff():
     assert changed_files(DIFF_WITH_TEST) == ["cli.py", "tests/test_cli.py"]
+
+
+@pytest.mark.parametrize("diff,paths", [
+    (DIFF_RENAME, ["main.py"]),
+    (DIFF_DELETE_TEST, ["tests/test_cli.py"]),
+    (DIFF_RENAME_TEST, ["tests/test_new.py"]),
+    (DIFF_RENAME + DIFF_DELETE_TEST + DIFF_RENAME_TEST + DIFF_ADD_TEST + DIFF_NO_TEST,
+     ["main.py", "tests/test_cli.py", "tests/test_new.py", "tests/test_added.py", "cli.py"]),
+])
+def test_changed_files_handles_renames_deletions_and_mixed_diffs(diff, paths):
+    assert changed_files(diff) == paths
+
+
+def test_source_rename_with_tests_is_confirmed():
+    evidence = check_pr_tests(DIFF_RENAME + DIFF_ADD_TEST)
+    assert evidence.status is Status.CONFIRMED
+    assert "1 test file(s)" in evidence.detail
+
+
+def test_source_rename_without_tests_is_unverified():
+    evidence = check_pr_tests(DIFF_RENAME)
+    assert evidence.status is Status.UNVERIFIED
+    assert "main.py" in evidence.detail
+    assert evidence.basis == "inferred"
+
+
+@pytest.mark.parametrize("diff", [DIFF_DELETE_TEST, DIFF_NO_TEST + DIFF_DELETE_TEST])
+def test_deleted_tests_do_not_confirm_test_changes(diff):
+    assert check_pr_tests(diff).status is Status.UNVERIFIED
+
+
+def test_deleted_source_with_changed_tests_is_confirmed():
+    diff = "--- a/cli.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n" + DIFF_RENAME_TEST
+    assert check_pr_tests(diff).status is Status.CONFIRMED
+
+
+def test_mixed_diff_counts_only_surviving_tests_once():
+    evidence = check_pr_tests(DIFF_RENAME + DIFF_DELETE_TEST + DIFF_RENAME_TEST + DIFF_ADD_TEST)
+    assert evidence.status is Status.CONFIRMED
+    assert evidence.detail == "2 test file(s) changed: tests/test_new.py, tests/test_added.py"
+
+
+def test_test_renamed_out_of_tests_does_not_confirm_test_changes():
+    diff = (
+        "diff --git a/tests/test_cli.py b/examples/cli.py\nsimilarity index 100%\n"
+        "rename from tests/test_cli.py\nrename to examples/cli.py\n"
+    )
+    evidence = check_pr_tests(DIFF_NO_TEST + diff)
+    assert evidence.status is Status.UNVERIFIED
+    assert "examples/cli.py" in evidence.detail
 
 
 def test_pr_without_test_changes_is_unverified_not_refuted():
