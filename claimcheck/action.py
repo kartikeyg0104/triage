@@ -38,11 +38,11 @@ LEVEL = {Status.CONFIRMED: "notice", Status.UNVERIFIED: "warning", Status.REFUTE
 
 
 def event_text(event: dict) -> tuple[int, str, bool] | None:
-    """Return (number, text, is_pr) for a pull_request or issues event."""
+    """Return (number, text, is_pr), recognizing the PR marker on issue comment payloads too."""
     for key, is_pr in (("pull_request", True), ("issue", False)):
         item = event.get(key)
         if item:
-            return item["number"], f"{item.get('title') or ''}\n\n{item.get('body') or ''}", is_pr
+            return item["number"], f"{item.get('title') or ''}\n\n{item.get('body') or ''}", is_pr or "pull_request" in item
     return None
 
 
@@ -223,12 +223,26 @@ def print_untrusted(text: str) -> None:
 
 def run(env: dict, http=_request, run_repro: revisions.RunRepro = sandbox.run_repro) -> int:
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text())
+    is_comment = env.get("GITHUB_EVENT_NAME") == "issue_comment" or "comment" in event
+    if is_comment:
+        comment = event.get("comment") or {}
+        body = comment.get("body")
+        if event.get("action") != "created" or not isinstance(body, str) or body.strip() != "/claimcheck":
+            print("claimcheck: ignoring comment; no recheck requested")
+            return 0
+        if comment.get("author_association") not in ("OWNER", "MEMBER", "COLLABORATOR"):
+            print("claimcheck: ignoring /claimcheck comment from a non-maintainer")
+            return 0
     found = event_text(event)
     if not found:
         print("claimcheck: no pull request or issue in this event; nothing to check")
         return 0
     number, text, is_pr = found
     repo_name, token = env["GITHUB_REPOSITORY"], env.get("GITHUB_TOKEN", "")
+    if is_comment and is_pr and token:
+        pr = json.loads(http("GET", f"{API}/repos/{repo_name}/pulls/{number}", token))
+        event = {**event, "pull_request": pr}
+        text = f"{pr.get('title') or ''}\n\n{pr.get('body') or ''}"
     diff = fetch_diff(repo_name, number, token, http) if is_pr and token else None
     root = Path(env.get("INPUT_PATH") or ".")
     repro, expect = env.get("INPUT_REPRO") or None, env.get("INPUT_EXPECT", "")
