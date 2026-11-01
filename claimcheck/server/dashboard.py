@@ -9,6 +9,7 @@ block below, by its hash. There are no forms and only GET routes, so nothing her
 import base64
 import hashlib
 import json
+import re
 from html import escape
 from urllib.parse import quote, urlencode
 
@@ -22,6 +23,8 @@ MAX_PAGE = 100_000
 STATUSES = ("received", "processing", "completed", "skipped", "failed")
 EVIDENCE_STATUSES = ("confirmed", "refuted", "unverified")
 EVIDENCE_COLUMNS = ("status", "kind", "claim", "basis", "detail", "source")
+GITHUB_SOURCE = re.compile(r"github:(issues|pull_request):([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/"
+                           r"([A-Za-z0-9_.-]+)#([1-9][0-9]*)")
 
 STYLE = """
 body{font:14px/1.45 system-ui,sans-serif;margin:1.5rem auto;max-width:72rem;padding:0 1rem;color:#1d1d1f}
@@ -86,6 +89,24 @@ def detail_href(investigation_id: str) -> str:
     return escape(f"/dashboard/investigations/{quote(investigation_id, safe='')}", quote=True)
 
 
+def source_link(source: str) -> str:
+    """Only a validated webhook source can supply an external destination."""
+    match = GITHUB_SOURCE.fullmatch(source)
+    if match is None or match[3] in (".", ".."):
+        return e(source)
+    event, owner, repo, number = match.groups()
+    route = "issues" if event == "issues" else "pull"
+    href = f"https://github.com/{owner}/{repo}/{route}/{number}"
+    return f'<a href="{e(href)}" rel="noopener noreferrer">{e(source)}</a>'
+
+
+def revision_code(revision: object) -> str:
+    """Keep the tested revision compact, with its full value available on hover."""
+    if not isinstance(revision, str) or not revision:
+        return block(revision)
+    return f'<code title="{e(revision)}">{e(revision[:7])}</code>'
+
+
 def list_href(status: str | None, number: int) -> str:
     query = ([("status", status)] if status else []) + ([("page", number)] if number else [])
     return escape("/dashboard" + (f"?{urlencode(query)}" if query else ""), quote=True)
@@ -144,15 +165,16 @@ def render_detail(investigation: Investigation) -> HTMLResponse:
     i = investigation
     parts = [f"<h1>Investigation <code>{e(i.id)}</code></h1>",
              "<dl>" + "".join(f"<dt>{name}</dt><dd>{value}</dd>" for name, value in (
-                 ("Source", e(i.source)), ("Status", status_span(i.status)), ("Created (UTC)", e(i.created_at)),
+                 ("Source", source_link(i.source)), ("Status", status_span(i.status)), ("Created (UTC)", e(i.created_at)),
                  ("Delivery", e(i.delivery_id)), ("Worker", e(i.worker)), ("Error", block(i.error)))) + "</dl>"]
     parts.append("<h2>Result</h2>")
     result = i.result
     if result is None:
         parts.append("<p>No result yet.</p>")
     elif isinstance(result, dict):
-        parts.append(render_fields({"Verdict": result.get("verdict"), "Extraction model": result.get("extraction_model"),
-                                    "Revision": result.get("revision")}))
+        parts.append("<dl>" + "".join(f"<dt>{name}</dt><dd>{value}</dd>" for name, value in (
+            ("Verdict", block(result.get("verdict"))), ("Extraction model", block(result.get("extraction_model"))),
+            ("Revision", revision_code(result.get("revision"))))) + "</dl>")
         parts.append("<h2>Claims</h2>" + render_evidence(result.get("evidence", [])))
     else:
         parts.append(block(result))
