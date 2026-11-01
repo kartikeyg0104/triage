@@ -151,6 +151,22 @@ class Store:
             row = conn.execute(f"SELECT {COLUMNS} FROM investigations WHERE id = ?", (investigation_id,)).fetchone()
         return _row(row) if row else None
 
+    def summary(self) -> dict:
+        """Counts for the dashboard tiles: every row, completed rows by verdict, pending and failed rows."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT status, json_extract(result, '$.verdict'), count(*) FROM investigations "
+                                "GROUP BY 1, 2").fetchall()
+        counts = dict.fromkeys(("total", "supported", "refuted", "unverified", "pending", "failed"), 0)
+        for status, verdict, n in rows:
+            counts["total"] += n
+            if status == "completed" and verdict in ("supported", "refuted", "unverified"):
+                counts[verdict] += n
+            elif status in ("received", "processing"):
+                counts["pending"] += n
+            elif status == "failed":
+                counts["failed"] += n
+        return counts
+
     def list(self, status: str | None = None, limit: int = 50, offset: int = 0) -> list[Investigation]:
         """Investigations newest first (insertion order breaks ties), optionally only one status."""
         where, params = ("WHERE status = ?", (status,)) if status is not None else ("", ())

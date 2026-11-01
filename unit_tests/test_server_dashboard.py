@@ -585,3 +585,58 @@ def test_live_unknown_id_and_mutating_methods(live):
     assert missing.status_code == 404
     assert_secure(missing)
     assert fetch(live, "/dashboard", "POST", b"")[0] == 405
+
+
+# Summary, readable values and the verdict banner
+
+
+def test_store_summary_counts_verdicts_and_pending(store):
+    for verdict in ("supported", "refuted", "refuted", "unverified"):
+        store.create("api", "completed", {}, {"verdict": verdict, "evidence": []})
+    store.create("github:issues:octo/widgets#1", "received", {}, delivery_id="d-s1")
+    store.create("api", "failed", {})
+    assert store.summary() == {"total": 6, "supported": 1, "refuted": 2, "unverified": 1, "pending": 1, "failed": 1}
+
+
+def test_list_page_shows_summary_tiles(client, store):
+    store.create("api", "completed", {}, {"verdict": "refuted", "evidence": []})
+    store.create("github:issues:octo/widgets#9", "received", {}, delivery_id="d-9")
+    page = client.get("/dashboard").text
+    assert '<section class="tiles">' in page
+    assert '<div class="tile t-refuted"><strong>1</strong><span>refuted</span></div>' in page
+    assert '<div class="tile t-pending"><strong>1</strong><span>pending</span></div>' in page
+
+
+def test_times_and_github_sources_are_readable_with_full_values_kept(client, store, db):
+    made, _ = store.create("github:pull_request:octo/widgets#7", "received", {}, delivery_id="d-r7")
+    set_created(db, made.id, "2026-01-02T03:04:05.678901+00:00")
+    page = client.get("/dashboard").text
+    assert '<time datetime="2026-01-02T03:04:05.678901+00:00">2026-01-02 03:04 UTC</time>' in page
+    assert 'title="github:pull_request:octo/widgets#7">octo/widgets #7 <small class="muted">PR</small>' in page
+
+
+def test_hostile_time_and_source_stay_escaped(client, store, db):
+    made, _ = store.create(f"github:issues:{IMG}#1", "received", {}, delivery_id="d-h1")
+    set_created(db, made.id, SCRIPT)
+    page = client.get("/dashboard").text
+    assert "<script" not in page and "<img" not in page
+
+
+def test_detail_has_verdict_banner_with_claim_counts(client, store):
+    investigation, _ = store.create("api", "completed", {"repo": "sample", "report": "x\n" * 30},
+                                    {**hostile_result(), "verdict": "refuted"})
+    page = client.get(f"/dashboard/investigations/{investigation.id}").text
+    assert '<div class="banner v-refuted">' in page
+    assert "1 refuted" in page and "1 confirmed" in page
+    assert "<details" in page  # long request text is collapsible
+
+
+def test_hostile_verdict_gets_a_plain_banner(client, store):
+    investigation, _ = store.create("api", "completed", {}, hostile_result())
+    page = client.get(f"/dashboard/investigations/{investigation.id}").text
+    assert '<div class="banner">' in page and "<script" not in page
+
+
+def test_empty_list_shows_how_to_start(client):
+    page = client.get("/dashboard").text
+    assert "No investigations" in page and "POST /v1/investigations" in page

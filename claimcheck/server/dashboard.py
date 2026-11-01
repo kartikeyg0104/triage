@@ -57,8 +57,24 @@ nav.pager{justify-content:flex-end;gap:1rem;align-items:center}
 article>header h2{margin:0;font-size:1.05rem}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:.45rem 1.5rem;margin:0}
 dt{font-weight:600;color:var(--pico-muted-color)}dd{margin:0}
-td,dd{word-break:break-word}pre{white-space:pre-wrap;word-break:break-word;margin:0;padding:.75rem}
+td,dd{overflow-wrap:break-word}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:.75rem}
 .muted{color:var(--pico-muted-color)}
+td a code{color:var(--pico-primary);text-decoration:underline;text-underline-offset:3px;background:none;padding:0}
+td time,td:first-child{white-space:nowrap}
+section.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr));gap:.75rem;margin-bottom:1.5rem}
+.tile{padding:.9rem 1rem;border-radius:var(--pico-border-radius);background:var(--pico-card-background-color);
+box-shadow:var(--pico-card-box-shadow);border-top:3px solid var(--pico-muted-border-color)}
+.tile strong{display:block;font-size:1.7rem;line-height:1.1}.tile span{color:var(--pico-muted-color);font-size:.85rem}
+.t-supported{border-top-color:#2e9e57}.t-refuted{border-top-color:#d93a2e}.t-unverified,.t-pending{border-top-color:#d9a21b}
+.t-failed{border-top-color:#8a8a8a}
+.banner{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1.25rem;padding:1rem 1.25rem;margin-bottom:1.5rem;
+border-radius:var(--pico-border-radius);border-left:6px solid var(--pico-muted-border-color);
+background:var(--pico-card-background-color);box-shadow:var(--pico-card-box-shadow)}
+.banner strong{font-size:1.5rem;text-transform:capitalize}
+.v-supported{border-left-color:#2e9e57}.v-refuted{border-left-color:#d93a2e}.v-unverified{border-left-color:#d9a21b}
+tr.c-confirmed td:first-child{box-shadow:inset 4px 0 #2e9e57}tr.c-refuted td:first-child{box-shadow:inset 4px 0 #d93a2e}
+tr.c-unverified td:first-child{box-shadow:inset 4px 0 #d9a21b}
+details summary{font-size:.9rem;color:var(--pico-muted-color)}
 """
 _STYLE_HASH = base64.b64encode(hashlib.sha256(STYLE.encode()).digest()).decode()
 HEADERS = {
@@ -135,6 +151,37 @@ def revision_code(revision: object) -> str:
     return f'<code title="{e(revision)}">{e(revision[:7])}</code>'
 
 
+def when(value: object) -> str:
+    """A short UTC time; the stored ISO value stays in `datetime`."""
+    if not isinstance(value, str) or len(value) < 16 or value[10] != "T":
+        return e(value)
+    return f'<time datetime="{e(value)}">{e(value[:10])} {e(value[11:16])} UTC</time>'
+
+
+def source_short(source: object) -> str:
+    """`octo/widgets #7 PR` for a webhook source, with the raw source on hover; anything else as is."""
+    match = GITHUB_SOURCE.fullmatch(source) if isinstance(source, str) else None
+    if match is None:
+        return e(source)
+    event, owner, repo, number = match.groups()
+    kind = "issue" if event == "issues" else "PR"
+    return f'<span title="{e(source)}">{e(owner)}/{e(repo)} #{e(number)} <small class="muted">{kind}</small></span>'
+
+
+def tiles(counts: dict) -> str:
+    names = ("total", "supported", "refuted", "unverified", "pending", "failed")
+    return '<section class="tiles">' + "".join(
+        f'<div class="tile t-{name}"><strong>{int(counts.get(name, 0))}</strong><span>{name}</span></div>'
+        for name in names) + "</section>"
+
+
+def long_text(value: object) -> str:
+    """Long multi-line text folds away; short values render as before."""
+    if isinstance(value, str) and value.count("\n") > 8:
+        return f"<details><summary>{value.count(chr(10)) + 1} lines</summary>{block(value)}</details>"
+    return block(value)
+
+
 def list_href(status: str | None, number: int) -> str:
     query = ([("status", status)] if status else []) + ([("page", number)] if number else [])
     return escape("/dashboard" + (f"?{urlencode(query)}" if query else ""), quote=True)
@@ -153,23 +200,28 @@ def table(head: str, rows: str) -> str:
             f"<tbody>{rows}</tbody></table></div>")
 
 
-def render_list(investigations: list[Investigation], status: str | None, number: int, more: bool) -> HTMLResponse:
+def render_list(investigations: list[Investigation], status: str | None, number: int, more: bool,
+                counts: dict | None = None) -> HTMLResponse:
     on = ' aria-current="page"'
     links = [f'<a href="{list_href(None, 0)}"{on if not status else ""}>all</a>']
     links += [f'<a href="{list_href(s, 0)}"{on if s == status else ""}>{s}</a>' for s in STATUSES]
     heading = "Investigations" + (f" with status {e(status)}" if status else "")
     shown = f"{len(investigations)} on page {number}, newest first"
     parts = [f'<hgroup><h1>{heading}</h1><p class="muted">{shown}</p></hgroup>',
+             tiles(counts) if counts else "",
              f'<nav class="filters" aria-label="Filter by status">{"".join(links)}</nav>']
     if investigations:
         rows = "".join(
-            f'<tr><td><a href="{detail_href(i.id)}"><code>{e(i.id)}</code></a></td><td>{e(i.source)}</td>'
+            f'<tr><td><a href="{detail_href(i.id)}"><code>{e(i.id)}</code></a></td><td>{source_short(i.source)}</td>'
             f"<td>{status_span(i.status)}</td><td>{status_span(verdict_of(i), VERDICTS)}</td>"
-            f"<td>{e(i.created_at)}</td></tr>" for i in investigations)
+            f"<td>{when(i.created_at)}</td></tr>" for i in investigations)
         head = "<th>ID</th><th>Source</th><th>Status</th><th>Verdict</th><th>Created (UTC)</th>"
         parts.append(table(head, rows))
     else:
-        parts.append(f"<article><p>No investigations{' on this page' if number > 1 else ''}.</p></article>")
+        parts.append(f'<article><p>No investigations{" on this page" if number > 1 else ""}.</p>'
+                     '<p class="muted">Start one with <code>POST /v1/investigations</code> '
+                     '(<code>{"repo": "...", "report": "..."}</code>) or point a GitHub webhook at '
+                     '<code>/v1/github/webhook</code>.</p></article>')
     pager = []
     if number > 1:
         pager.append(f'<a href="{list_href(status, number - 1)}">&larr; newer</a>')
@@ -180,7 +232,7 @@ def render_list(investigations: list[Investigation], status: str | None, number:
 
 
 def render_fields(fields: dict) -> str:
-    return "<dl>" + "".join(f"<dt>{e(name)}</dt><dd>{block(value)}</dd>" for name, value in fields.items()) + "</dl>"
+    return "<dl>" + "".join(f"<dt>{e(name)}</dt><dd>{long_text(value)}</dd>" for name, value in fields.items()) + "</dl>"
 
 
 def render_evidence(evidence: object) -> str:
@@ -195,20 +247,34 @@ def render_evidence(evidence: object) -> str:
             continue
         cells = [status_span(item.get("status"), EVIDENCE_STATUSES)]
         cells += [block(item.get(column)) for column in EVIDENCE_COLUMNS[1:]]
-        rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+        tint = f' class="c-{item.get("status")}"' if item.get("status") in EVIDENCE_STATUSES else ""
+        rows.append(f"<tr{tint}>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
     return table("".join(f"<th>{column.capitalize()}</th>" for column in EVIDENCE_COLUMNS), "".join(rows))
+
+
+def banner(result: dict) -> str:
+    verdict = result.get("verdict")
+    css = f" v-{verdict}" if verdict in VERDICTS else ""
+    evidence = result.get("evidence")
+    items = [item for item in evidence if isinstance(item, dict)] if isinstance(evidence, list) else []
+    counts = [f"{n} {status}" for status in EVIDENCE_STATUSES
+              if (n := sum(item.get("status") == status for item in items))]
+    summary = ", ".join(counts) if counts else "no checkable claims"
+    return (f'<div class="banner{css}"><span class="muted">Verdict</span><strong>{e(verdict)}</strong>'
+            f'<span>{e(summary)}</span></div>')
 
 
 def render_detail(investigation: Investigation) -> HTMLResponse:
     i = investigation
     parts = [f'<hgroup><h1>Investigation <code>{e(i.id)}</code></h1><p class="muted">{e(i.source)}</p></hgroup>',
              card("Overview", "<dl>" + "".join(f"<dt>{name}</dt><dd>{value}</dd>" for name, value in (
-                 ("Source", source_link(i.source)), ("Status", status_span(i.status)), ("Created (UTC)", e(i.created_at)),
+                 ("Source", source_link(i.source)), ("Status", status_span(i.status)), ("Created", when(i.created_at)),
                  ("Delivery", e(i.delivery_id)), ("Worker", e(i.worker)), ("Error", block(i.error)))) + "</dl>")]
     result = i.result
     if result is None:
         parts.append(card("Result", "<p>No result yet.</p>"))
     elif isinstance(result, dict):
+        parts.insert(1, banner(result))
         parts.append(card("Result", "<dl>" + "".join(f"<dt>{name}</dt><dd>{value}</dd>" for name, value in (
             ("Verdict", status_span(result.get("verdict"), VERDICTS)),
             ("Extraction model", block(result.get("extraction_model"))),
@@ -237,7 +303,7 @@ def router(store: Store) -> APIRouter:
             return error_page(400, "Bad request", f"page must be a whole number from 1 to {MAX_PAGE}")
         number = int(raw)
         found = store.list(status, limit=PAGE_SIZE + 1, offset=(number - 1) * PAGE_SIZE)
-        return render_list(found[:PAGE_SIZE], status, number, more=len(found) > PAGE_SIZE)
+        return render_list(found[:PAGE_SIZE], status, number, more=len(found) > PAGE_SIZE, counts=store.summary())
 
     # `:path` so an id containing a slash still reaches this handler and gets the HTML 404 page.
     @routes.get("/dashboard/investigations/{investigation_id:path}")
