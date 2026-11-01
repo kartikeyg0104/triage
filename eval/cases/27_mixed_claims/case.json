@@ -1,0 +1,15 @@
+{
+  "truth": "normalize_handle and AccountRecord are defined in accounts/identities.py and import successfully. normalize_handle('Alice/TEAM') returns 'alice/TEAM'; poc.py asserts 'alice/team' and fails with AssertionError: alice/TEAM, confirming the explicit repro. AccountRecord stores the same partially normalized value. strip_suffix is absent from the entire repo and is not dynamically created, so that named function claim is false. send_welcome appears only as a hook dictionary key: it is not a defined function and the caller may supply any callable or none. A truth test observes no call without a hook and one call with a recording hook; the symbol's existence is unresolved statically, so its expectation stays unverified. These mixed claims imply an overall refuted verdict despite the confirmed repro.",
+  "repro": "python3 poc.py",
+  "expect": "AssertionError: alice/TEAM",
+  "expected": {
+    "claims": {
+      "symbol:normalize_handle": "confirmed",
+      "symbol:AccountRecord": "confirmed",
+      "symbol:strip_suffix": "refuted",
+      "symbol:send_welcome": "unverified",
+      "repro": "confirmed"
+    },
+    "overall": "refuted"
+  }
+}

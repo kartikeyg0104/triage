@@ -1,0 +1,7 @@
+{
+  "truth": "parse is a function defined at repo/tomlette/impl.py:1 and re-exported from the package root by `from .impl import parse` at repo/tomlette/__init__.py:3, so `import tomlette; tomlette.parse` is that function. The name the report gives exists, whether it is reached through the package root or through tomlette.impl.",
+  "expected": {
+    "claims": {"symbol:parse": "confirmed"},
+    "overall": "supported"
+  }
+}

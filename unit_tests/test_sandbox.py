@@ -1,5 +1,12 @@
+import os
+import shlex
+import shutil
+import signal
 import socket
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -7,6 +14,8 @@ from claimcheck import sandbox
 from claimcheck.models import Claim, Status
 
 needs_isolation = pytest.mark.skipif(sandbox.detect_isolation() is None, reason="no network isolation on this machine")
+needs_bwrap = pytest.mark.skipif(not sys.platform.startswith("linux") or not shutil.which("bwrap"),
+                                 reason="bubblewrap requires Linux and bwrap")
 
 
 @pytest.fixture
@@ -128,6 +137,195 @@ def test_inside_repo_symlink_still_works(repo_beside_secret):
     assert "not copied" not in evidence.detail
 
 
+@pytest.fixture
+def linux_wrappers(monkeypatch):
+    """Exercise Linux wrapper selection even on hosts that cannot create namespaces."""
+    available = {"bwrap", "unshare"}
+    probes = []
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda tool: f"/usr/bin/{tool}" if tool in available else None)
+
+    def probe(args, **kwargs):
+        probes.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", probe)
+    return available, probes
+
+
+def test_linux_prefers_bwrap_and_mounts_only_readonly_system_dirs(linux_wrappers):
+    _, probes = linux_wrappers
+    name, prefix = sandbox.detect_isolation()
+    assert name == "bwrap"
+    assert prefix[0] == "bwrap"
+    assert "--unshare-all" in prefix
+    assert "--die-with-parent" in prefix
+    assert prefix[prefix.index("--tmpfs") + 1] == "/tmp"
+    assert prefix[prefix.index("--proc") + 1] == "/proc"
+    assert prefix[prefix.index("--dev") + 1] == "/dev"
+    mounts = [prefix[i + 1:i + 3] for i, arg in enumerate(prefix) if arg == "--ro-bind"]
+    expected = [path for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc") if Path(path).is_dir()]
+    assert mounts == [[path, path] for path in expected]
+    assert "--bind" not in prefix
+    assert len(probes) == 1 and probes[0][0] == "bwrap"
+    assert probes[0][-1] == "true"
+
+
+def test_bwrap_omits_system_dirs_that_do_not_exist(linux_wrappers, monkeypatch):
+    monkeypatch.setattr(Path, "is_dir", lambda path: str(path) in ("/usr", "/bin", "/etc"))
+    name, prefix = sandbox.detect_isolation()
+    assert name == "bwrap"
+    assert "/lib" not in prefix and "/lib64" not in prefix and "/sbin" not in prefix
+
+
+def test_linux_uses_unshare_when_bwrap_is_missing(linux_wrappers):
+    available, probes = linux_wrappers
+    available.remove("bwrap")
+    assert sandbox.detect_isolation() == ("unshare-net", ["unshare", "-rn"])
+    assert probes == [["unshare", "-rn", "true"]]
+
+
+@pytest.mark.parametrize("failure", [1, OSError("cannot start wrapper"), subprocess.TimeoutExpired("bwrap", 10)])
+def test_unusable_bwrap_does_not_fall_back_to_host_file_access(linux_wrappers, monkeypatch, failure):
+    _, probes = linux_wrappers
+
+    def probe(args, **kwargs):
+        probes.append(args)
+        if isinstance(failure, Exception):
+            raise failure
+        return subprocess.CompletedProcess(args, failure)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", probe)
+    assert sandbox.detect_isolation() is None
+    assert len(probes) == 1 and probes[0][0] == "bwrap"
+
+
+def test_linux_refuses_when_both_wrappers_are_missing(linux_wrappers):
+    available, probes = linux_wrappers
+    available.clear()
+    assert sandbox.detect_isolation() is None
+    assert not probes
+
+
+@pytest.fixture
+def repro_process(monkeypatch):
+    """Record the launch without running a fake isolation wrapper on the host."""
+    launches = []
+    result = {"returncode": 1, "stdout": "crash", "stderr": ""}
+
+    class Process:
+        def __init__(self, args, **kwargs):
+            launches.append((args, kwargs))
+            self.returncode = result["returncode"]
+
+        def communicate(self, timeout=None):
+            return result["stdout"], result["stderr"]
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", Process)
+    monkeypatch.setattr(sandbox, "_plan_limits", lambda: ([], [], []))
+    monkeypatch.setattr(sandbox, "_kill_group", lambda proc: None)
+    return launches, result
+
+
+def test_bwrap_runs_in_the_bound_copy_with_a_private_home(repo, monkeypatch, repro_process):
+    launches, _ = repro_process
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("bwrap", ["bwrap", "--unshare-all"]))
+    evidence = sandbox.run_repro(repo, "python3 boom.py", "crash")
+    args, options = launches[0]
+    bind = args.index("--bind")
+    assert args[bind + 1] == str(options["cwd"])
+    assert Path(args[bind + 1]) != repo
+    assert args[bind + 2] == "/repo"
+    assert args[args.index("--chdir") + 1] == "/repo"
+    assert args[-4:] == ["--", "sh", "-c", "python3 boom.py"]
+    assert options["env"]["HOME"] == "/tmp"
+    assert options["start_new_session"]
+    assert evidence.status is Status.CONFIRMED
+    assert evidence.source == "bwrap: python3 boom.py"
+
+
+def test_unshare_launch_remains_unchanged(repo, monkeypatch, repro_process):
+    launches, _ = repro_process
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("unshare-net", ["unshare", "-rn"]))
+    evidence = sandbox.run_repro(repo, "python3 boom.py", "crash")
+    args, options = launches[0]
+    assert args == ["unshare", "-rn", "sh", "-c", "python3 boom.py"]
+    assert options["env"]["HOME"] == str(options["cwd"].parent)
+    assert evidence.status is Status.CONFIRMED
+    assert evidence.source == "unshare-net: python3 boom.py"
+
+
+def test_bwrap_repo_path_is_normalised_in_evidence(repo, monkeypatch, repro_process):
+    _, result = repro_process
+    result["stdout"] = "RuntimeError: /repo/boom.py"
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("bwrap", ["bwrap"]))
+    evidence = sandbox.run_repro(repo, "python3 boom.py", "RuntimeError")
+    assert "<repo>/boom.py" in evidence.detail
+    assert "/repo/" not in evidence.detail
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_bwrap_setup_failure_never_gives_a_verdict(repo, monkeypatch, repro_process, code):
+    _, result = repro_process
+    result.update(returncode=code, stdout="", stderr="bwrap: Creating new namespace failed: Operation not permitted")
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("bwrap", ["bwrap"]))
+    evidence = sandbox.run_repro(repo, "true", "Operation not permitted")
+    assert evidence.status is Status.UNVERIFIED
+    assert "setup" in evidence.detail
+    assert "bwrap" in evidence.source
+
+
+def test_wrapper_disappearing_after_detection_is_unverified(repo, monkeypatch, repro_process):
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("wrapper disappeared")
+
+    monkeypatch.setattr(sandbox, "detect_isolation", lambda: ("bwrap", ["bwrap"]))
+    monkeypatch.setattr(sandbox.subprocess, "Popen", missing)
+    evidence = sandbox.run_repro(repo, "true", "wrapper disappeared")
+    assert evidence.status is Status.UNVERIFIED
+    assert "refused" in evidence.detail
+    assert "bwrap" in evidence.source
+
+
+@needs_bwrap
+@pytest.mark.parametrize("location", ["sibling", "home"])
+def test_bwrap_cannot_read_a_host_file_outside_the_copy(tmp_path, location):
+    """Direct absolute reads must be blocked too, without relying on symlink filtering."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    parent = Path.home() if location == "home" else tmp_path
+    with sandbox.tempfile.TemporaryDirectory(prefix="claimcheck-host-", dir=parent) as host:
+        secret = Path(host) / "id_rsa"
+        secret.write_text(HOST_SECRET + "\n")
+        evidence = sandbox.run_repro(repo, f"cat {shlex.quote(str(secret))}; exit 1", HOST_SECRET)
+    assert evidence.source.startswith("bwrap:")
+    assert HOST_SECRET not in evidence.detail
+    assert evidence.status is Status.UNVERIFIED
+    assert "No such file or directory" in evidence.detail
+
+
+@needs_bwrap
+def test_bwrap_copy_and_private_tmp_are_writable(tmp_path):
+    (tmp_path / "inside.txt").write_text("inside-content\n")
+    evidence = sandbox.run_repro(tmp_path,
+                                 "cat inside.txt; touch created.txt /tmp/created.txt; "
+                                 "test -f created.txt && test -f /tmp/created.txt", "")
+    assert evidence.status is Status.REFUTED
+    assert evidence.source.startswith("bwrap:")
+    assert "inside-content" in evidence.detail
+    assert not (tmp_path / "created.txt").exists()
+
+
+@needs_bwrap
+def test_bwrap_system_dirs_are_readonly(tmp_path):
+    evidence = sandbox.run_repro(tmp_path,
+                                 "python3 -c 'import os; assert os.statvfs(\"/usr\").f_flag & os.ST_RDONLY; "
+                                 "print(\"READONLY\")'", "")
+    assert evidence.source.startswith("bwrap:")
+    assert evidence.status is Status.REFUTED
+    assert "READONLY" in evidence.detail
+
+
 CLAIM = Claim("repro", "r")
 
 
@@ -159,3 +357,105 @@ def test_setup_failures_are_never_confirmed_or_refuted(code, output):
     evidence = sandbox.classify(CLAIM, code, output + " buffer overflow", "buffer overflow", "src")
     assert evidence.status is Status.UNVERIFIED
     assert "setup or environment failure" in evidence.detail
+
+
+# Resource limits (issue #49). Each test lowers one ceiling so it trips quickly and cheaply.
+
+@needs_isolation
+def test_cpu_spinner_is_stopped_by_a_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox.LIMITS, "cpu_seconds", 1)
+    (tmp_path / "spin.py").write_text("while True:\n    pass\n")
+    evidence = sandbox.run_repro(tmp_path, "python3 spin.py", "", timeout=8)
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "timed out" not in evidence.detail
+
+
+@needs_isolation
+def test_huge_file_write_is_stopped_by_a_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox.LIMITS, "file_bytes", 8 << 20)
+    (tmp_path / "fill.py").write_text(
+        "with open('big.bin', 'wb') as f:\n    for _ in range(64):\n        f.write(b'x' * (1 << 20))\n"
+        "print('WROTE ALL')\nraise SystemExit(1)\n"
+    )
+    evidence = sandbox.run_repro(tmp_path, "python3 fill.py", "WROTE ALL")
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "WROTE ALL" not in evidence.detail
+
+
+@needs_isolation
+def test_memory_hog_is_stopped_where_the_os_enforces_it(tmp_path, monkeypatch):
+    enforced, reason = sandbox.memory_limit_enforced()
+    if not enforced:
+        pytest.skip(f"memory limit not enforced here: {reason}")
+    monkeypatch.setitem(sandbox.LIMITS, "memory_bytes", 512 << 20)
+    (tmp_path / "hog.py").write_text("b = bytearray(2 << 30)\nprint('ALLOCATED')\nraise SystemExit(1)\n")
+    evidence = sandbox.run_repro(tmp_path, "python3 hog.py", "ALLOCATED")
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "ALLOCATED" not in evidence.detail
+
+
+@needs_isolation
+def test_unenforced_memory_limit_is_recorded_when_a_run_is_stopped(tmp_path, monkeypatch):
+    enforced, reason = sandbox.memory_limit_enforced()
+    if enforced:
+        pytest.skip("the OS enforces the memory limit, nothing to record")
+    monkeypatch.setitem(sandbox.LIMITS, "cpu_seconds", 1)
+    (tmp_path / "spin.py").write_text("while True:\n    pass\n")
+    stopped = sandbox.run_repro(tmp_path, "python3 spin.py", "", timeout=8)
+    timed_out = sandbox.run_repro(tmp_path, "sleep 5", "", timeout=1)
+    assert "memory limit not enforced" in stopped.detail
+    assert "memory limit not enforced" in timed_out.detail
+
+
+@needs_isolation
+@pytest.mark.skipif(os.geteuid() == 0, reason="the process limit does not apply to root")
+def test_bounded_fork_loop_is_stopped_by_a_resource_limit(tmp_path, monkeypatch):
+    monkeypatch.setitem(sandbox.LIMITS, "extra_processes", 32)
+    (tmp_path / "forks.py").write_text(
+        "import os, sys, time\n"
+        "for _ in range(300):\n"
+        "    try:\n        pid = os.fork()\n"
+        "    except OSError as e:\n        print('FORK FAILED', e)\n        sys.exit(1)\n"
+        "    if pid == 0:\n        os.close(0); os.close(1); os.close(2)\n        time.sleep(3)\n        os._exit(0)\n"
+        "print('FORKED ALL')\nsys.exit(1)\n"
+    )
+    evidence = sandbox.run_repro(tmp_path, "python3 forks.py", "FORK FAILED")
+    assert evidence.status is Status.UNVERIFIED
+    assert "resource limit" in evidence.detail
+    assert "FORKED ALL" not in evidence.detail
+
+
+@needs_isolation
+def test_normal_repro_still_confirms_under_default_limits(repo):
+    evidence = sandbox.run_repro(repo, "for i in 1 2 3; do python3 ok.py; done; python3 boom.py", "crash on long url")
+    assert evidence.status is Status.CONFIRMED
+    assert "resource limit" not in evidence.detail
+
+
+@pytest.mark.parametrize("code,output", [
+    (-signal.SIGXCPU, ""),
+    (128 + signal.SIGXCPU, ""),
+    (-signal.SIGXFSZ, ""),
+    (128 + signal.SIGXFSZ, ""),
+    (-signal.SIGKILL, ""),
+    (137, ""),
+    (1, "BlockingIOError: [Errno 35] Resource temporarily unavailable"),
+    (1, "sh: fork: Resource temporarily unavailable"),
+    (1, "Traceback ... MemoryError"),
+    (0, "MemoryError caught, carrying on"),
+])
+def test_limit_hits_are_recognised(code, output):
+    assert sandbox.limit_hit(code, output)
+
+
+@pytest.mark.parametrize("code,output", [(1, "KeyError: x"), (0, "fine"), (2, "usage: poc")])
+def test_ordinary_failures_are_not_limit_hits(code, output):
+    assert sandbox.limit_hit(code, output) is None
+
+
+def test_shell_cannot_fork_counts_as_a_limit_hit():
+    # Linux dash reports a hit process limit as "sh: 1: Cannot fork"; seen on CI.
+    assert sandbox.limit_hit(2, "sh: 1: Cannot fork")
