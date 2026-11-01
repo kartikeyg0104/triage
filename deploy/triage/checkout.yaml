@@ -1,0 +1,43 @@
+# Clone kartikeyg0104/triage into the repos volume before the API and the worker start. Both still
+# mount /repos read-only; only this init container writes to it. Same image (it ships git) and the
+# same locked-down security context as the other containers.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claimcheck-api
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: checkout
+          image: ghcr.io/kartikeyg0104/claimcheck:latest
+          command: ["git"]
+          args: ["clone", "--depth", "1", "--single-branch", "--no-tags",
+                 "https://github.com/kartikeyg0104/triage.git", "/repos/triage"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: repos
+              mountPath: /repos
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: repos
+          emptyDir:
+            sizeLimit: 256Mi

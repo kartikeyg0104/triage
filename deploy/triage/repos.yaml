@@ -1,0 +1,8 @@
+# The worker's --repos map: our own repo, checked out at /repos/triage by the init container.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claimcheck-repos
+data:
+  repos.json: |
+    {"kartikeyg0104/triage": "triage"}

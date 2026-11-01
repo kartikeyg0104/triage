@@ -8,7 +8,7 @@ Kustomize manifests for the long-running service: the HTTP API (`python -m claim
 | Deployment | `claimcheck-api` | one pod: container `api` and container `worker` |
 | Service | `claimcheck-api` | ClusterIP, port 8080 |
 | PersistentVolumeClaim | `claimcheck-data` | ReadWriteOnce, holds `/data/claimcheck.db` |
-| ConfigMap | `claimcheck-repos` | the worker's `--repos` map (empty by default) |
+| ConfigMap | `claimcheck-repos` | the worker's `--repos` map (empty by default; [`deploy/triage`](../triage) maps this repo) |
 
 The Secret `claimcheck-secrets` is **not** in the manifests. Create it yourself.
 
@@ -46,7 +46,16 @@ The API and the worker share one SQLite file. SQLite locking works only between 
 
 ## Repositories
 
-Both processes only read checkouts under `--repo-root /repos`, mounted read-only. In the base, `/repos` is an empty placeholder volume, and the worker's map (`claimcheck-repos`, `repos.json`) is `{}`, so every webhook event is recorded and then `skipped`. To check real repos, patch the `repos` volume to something holding the checkouts (a PVC, or an image volume) and fill in the map, e.g. `{"octo/widgets": "widgets"}` for `/repos/widgets`. The worker refuses to start if a mapped path is not a directory under `/repos`.
+Both processes only read checkouts under `--repo-root /repos`, mounted read-only. In the base, `/repos` is an empty placeholder volume, and the worker's map (`claimcheck-repos`, `repos.json`) is `{}`, so every webhook event is recorded and then `skipped`. To check real repos, patch the `repos` volume to something holding the checkouts (a PVC, or an image volume) and fill in the map, e.g. `{"kartikeyg0104/triage": "triage"}` for `/repos/triage`. The worker refuses to start if a mapped path is not a directory under `/repos`.
+
+[`deploy/triage`](../triage) does exactly that for this repository: it maps `kartikeyg0104/triage` to `/repos/triage` and adds a `checkout` init container (same image, same locked-down security context) that shallow-clones it from GitHub into the `repos` emptyDir before the API and the worker start. Both still mount `/repos` read-only.
+
+```sh
+kubectl apply -k deploy/triage
+kubectl -n claimcheck-service rollout restart deploy/claimcheck-api   # re-clone to pick up newer commits
+```
+
+The clone needs egress to github.com from the pod. `unit_tests/test_service_triage_overlay.py` and `unit_tests/integration/test_service_triage_cluster.py` cover it.
 
 ## Security settings
 
