@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="where the repro runs: a local no-network process, or a locked-down Kubernetes Job")
     check.add_argument("--k8s-namespace", default="claimcheck")
     check.add_argument("--k8s-image", default="python:3.12-slim")
+    check.add_argument("--k8s-require-digest", action="store_true",
+                       help="refuse to run an image without a complete @sha256: digest (unverified)")
     check.add_argument("--k8s-runtime-class", help="e.g. gvisor; only if the cluster has that RuntimeClass")
     check.add_argument("--kube-context", help="kubectl context to use")
     check.add_argument("--k8s-impersonate", metavar="USER",
@@ -98,7 +100,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.executor == "kubernetes":
         run_repro = k8s.KubernetesExecutor(namespace=args.k8s_namespace, image=args.k8s_image,
                                            runtime_class=args.k8s_runtime_class, context=args.kube_context,
-                                           impersonate=args.k8s_impersonate).run_repro
+                                           impersonate=args.k8s_impersonate,
+                                           **({"require_digest": True} if args.k8s_require_digest else {})).run_repro
     verdict, model = run_check(args.repo, args.report.read_text(), diff, args.repro, args.expect, not args.no_model,
                                run_repro, base=args.base, head=args.head, model_name=args.model_name)
     print((report.to_json if args.json else report.to_markdown)(verdict, model), end="")
