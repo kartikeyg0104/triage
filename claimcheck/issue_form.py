@@ -27,6 +27,7 @@ MAX_FIELD_CHARS = 4000
 MAX_BODY_CHARS = 65536  # GitHub's own limit on an issue body
 
 _NO_RESPONSE = "_No response_"
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
 _HEADING = re.compile(r"^### (.+?)\s*$")
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 _LABEL_TO_ID = {label: field_id for field_id, label in FIELDS.items()}
@@ -47,6 +48,8 @@ class IssueForm:
 def parse_issue_form(body: str | None) -> IssueForm:
     """Parse a rendered issue-form body. Unknown or repeated sections are ignored."""
     text = (body or "")[:MAX_BODY_CHARS].replace("\r\n", "\n").replace("\r", "\n")
+    # Hidden template instructions must not supply values, headings or fences.
+    text = _HTML_COMMENT.sub("", text)
     sections: dict[str, list[str]] = {}
     current: list[str] | None = None
     fence = ""
