@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import checks, extract, k8s, report, revisions, sandbox
+from . import checks, extract, k8s, report, revisions, sandbox, versions
 from .models import Claim, Evidence, Status, Verdict
 
 
@@ -29,6 +29,7 @@ def run_check(repo: Path, report_text: str, diff: str | None, repro: str | None,
     verdict = Verdict(revision=git_revision(repo), report_truncated=extraction.truncated)
     for claim in extraction.claims:
         verdict.evidence.append(checks.check_symbol(repo, claim.target))
+    verdict.evidence.extend(versions.check_versions(repo, report_text))
     if extraction.note:
         verdict.evidence.append(Evidence(Claim("extraction", "Model claim extraction was available"),
                                          Status.UNVERIFIED, extraction.note))

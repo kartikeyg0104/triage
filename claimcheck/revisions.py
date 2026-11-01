@@ -120,6 +120,10 @@ def verify_fix(repo: Path, base: str, head: str, command: str, expect: str, run_
         if shas[side] is None:
             return Evidence(claim, Status.UNVERIFIED, f"setup failure: {side} ref {refs[side]!r} does not name a commit here",
                             source)
+    if shas["base"] == shas["head"]:
+        return Evidence(claim, Status.UNVERIFIED,
+                        f"setup failure: base and head resolve to the same commit {shas['base']}; repro not run",
+                        source)
     runs = _run_both(repo, prefix.stdout.strip(), shas, claim, command, expect, run_repro, timeout)
     status, headline = _decide(runs["base"], runs["head"])
     sides = ". ".join(f"{side} {shas[side]}: {runs[side].detail}" for side in refs)
