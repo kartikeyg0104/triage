@@ -4,15 +4,20 @@ import json
 import re
 
 from . import __version__
+from .extract import MAX_REPORT_CHARS
 from .models import Status, Verdict
 
 ICON = {Status.CONFIRMED: "✓", Status.REFUTED: "✗", Status.UNVERIFIED: "!"}
 EXIT_CODE = {"supported": 0, "refuted": 1, "unverified": 2}
+TRUNCATION_NOTE = (f"Report truncated to {MAX_REPORT_CHARS // 1024} KiB before the model; "
+                   "claims after the cut were found by regex only")
 
 
 def to_markdown(verdict: Verdict, model: str | None) -> str:
     lines = ["# claimcheck report", "", f"**Verdict: {verdict.outcome}**", ""]
     lines.append(f"Claim extraction: {model if model else 'regex fallback (no model used)'}")
+    if verdict.report_truncated:
+        lines.append(f"**{TRUNCATION_NOTE}.**")
     lines.append(f"Tested revision: {'`' + verdict.revision + '`' if verdict.revision else 'unknown (not a git checkout)'}")
     lines += ["", "| | Claim | Evidence | Basis | Source |", "|---|---|---|---|---|"]
     for e in verdict.evidence:
@@ -27,6 +32,7 @@ def to_json(verdict: Verdict, model: str | None) -> str:
         "verdict": verdict.outcome,
         "extraction_model": model,
         "revision": verdict.revision or None,
+        "report_truncated": verdict.report_truncated,
         "evidence": [
             {"kind": e.claim.kind, "claim": e.claim.text, "status": e.status.value, "basis": e.basis,
              "detail": e.detail, "source": e.source}
@@ -88,7 +94,8 @@ def to_sarif(verdict: Verdict, model: str | None, repository_uri: str | None = N
     run = {"tool": {"driver": {"name": "claimcheck", "version": __version__, "informationUri": INFORMATION_URI,
                                "rules": rules}},
            "results": results,
-           "properties": {"verdict": verdict.outcome, "extractionModel": model}}
+           "properties": {"verdict": verdict.outcome, "extractionModel": model,
+                          "reportTruncated": verdict.report_truncated}}
     if verdict.revision:
         run["versionControlProvenance"] = [{"repositoryUri": repository_uri or UNKNOWN_REPOSITORY,
                                             "revisionId": verdict.revision}]
