@@ -60,7 +60,7 @@ def test_ground_truth_cases_through_kubernetes(tmp_path):
         for run in cluster_case["runs"]:
             if "repro" in run["claims"]:
                 assert run["repro_source"].startswith(f"kubernetes[{NAMESPACE}/")
-                assert "(egress blocked, verified):" in run["repro_source"]
+                assert "(egress blocked, verified)" in run["repro_source"]
             else:
                 assert run["repro_source"] is None
     assert cluster["executor"] == {"name": "kubernetes", "context": CONTEXT, "namespace": NAMESPACE,
