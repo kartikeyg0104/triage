@@ -4,6 +4,8 @@ A connection is opened per call so the store is safe to use from the server's th
 several worker processes sharing the same file.
 """
 
+from __future__ import annotations  # `list` is also a Store method name; keep annotations lazy on 3.12
+
 import json
 import sqlite3
 import time
