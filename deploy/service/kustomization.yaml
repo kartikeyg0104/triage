@@ -1,0 +1,25 @@
+# The claimcheck service (API + webhook worker) in namespace claimcheck-service.
+# Separate from deploy/k8s, which is the executor namespace (claimcheck) for repro Jobs.
+#   kubectl apply -f deploy/service/namespace.yaml
+#   kubectl -n claimcheck-service create secret generic claimcheck-secrets \
+#     --from-literal=CLAIMCHECK_API_TOKEN=... --from-literal=CLAIMCHECK_WEBHOOK_SECRET=...
+#   kubectl apply -k deploy/service
+# See deploy/service/README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: claimcheck-service
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+# Placeholder image name. Pin your own build in an overlay, e.g.
+#   images: [{name: ghcr.io/kartikeyg0104/claimcheck, newName: registry.example/claimcheck, digest: "sha256:..."}]
+images:
+  - name: ghcr.io/kartikeyg0104/claimcheck
+    newTag: latest
+labels:
+  - pairs:
+      app.kubernetes.io/name: claimcheck
+      app.kubernetes.io/part-of: claimcheck-service

@@ -1,0 +1,11 @@
+{
+  "truth": "The report writes each method as Class.method(). claimcheck checks the method name, not the class prefix: it is asked whether parse_header, from_lines and validate exist (HeaderParser is never written as a call or alone in backticks, so it is not asked about). parse_header is a method of HeaderParser at repo/headers.py:10 and from_lines a classmethod at repo/headers.py:6; both exist on HeaderParser. validate appears nowhere in the repo and HeaderParser has no such attribute (hasattr(HeaderParser, 'validate') is False), so the method the report blames for not running does not exist.",
+  "expected": {
+    "claims": {
+      "symbol:parse_header": "confirmed",
+      "symbol:from_lines": "confirmed",
+      "symbol:validate": "refuted"
+    },
+    "overall": "refuted"
+  }
+}
