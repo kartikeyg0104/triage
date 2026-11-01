@@ -1,4 +1,4 @@
-"""deploy/k8s: ResourceQuota and LimitRange for namespace claimcheck, checked without a cluster.
+"""deploy/k8s: RBAC, ResourceQuota and LimitRange, checked without a cluster.
 
 Needs PyYAML (skips without it, like the manifest tests in test_k8s.py); the cluster tests in
 unit_tests/integration/test_k8s_quota.py check the same objects on a real API server.
@@ -58,6 +58,27 @@ def container_limits(manifests):
 
 def executor_container():
     return k8s.build_job("claimcheck-x", "python:3.12-slim", "true", timeout=30)["spec"]["template"]["spec"]["containers"][0]
+
+
+def test_role_grants_exactly_the_executor_permissions_including_events(manifests: dict) -> None:
+    """Admission events are readable without granting writes or access outside the namespace."""
+    assert not [kind for kind, _ in manifests if kind in ("ClusterRole", "ClusterRoleBinding")]
+    role = manifests[("Role", "claimcheck-executor")]
+    assert role["metadata"]["namespace"] == NAMESPACE
+    granted = {}
+    for rule in role["rules"]:
+        assert not rule.get("resourceNames") and not rule.get("nonResourceURLs")
+        for group in rule["apiGroups"]:
+            for resource in rule["resources"]:
+                granted.setdefault((group, resource), set()).update(rule["verbs"])
+    assert granted == {
+        ("", "configmaps"): {"get", "create", "list", "delete", "watch"},
+        ("networking.k8s.io", "networkpolicies"): {"get", "create", "list", "delete", "watch"},
+        ("batch", "jobs"): {"get", "create", "list", "delete", "watch"},
+        ("", "pods"): {"list"},
+        ("", "pods/log"): {"get"},
+        ("", "events"): {"get", "list"},
+    }
 
 
 def test_quota_caps_every_resource_the_issue_names(quota):

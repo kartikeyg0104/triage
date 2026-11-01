@@ -1,6 +1,7 @@
 # Exactly what claimcheck/k8s.py's kubectl calls need, in namespace claimcheck only:
 #   kubectl apply -f -  (ConfigMap, NetworkPolicy, Job)   get (does it exist?), create
 #   kubectl get pods -l <run> -o json                     pods: list
+#   kubectl get events --field-selector <Job FailedCreate> events: get, list (read only)
 #   kubectl logs job/<name>                               jobs: get, pods: list, pods/log: get
 #   kubectl delete jobs,configmaps,networkpolicies -l <run> --wait=true
 #                                                         list, delete, watch (while an object is
@@ -8,8 +9,8 @@
 # No patch: every run uses fresh object names, so apply always creates; re-applying an existing
 # object would be refused. Not granted either: secrets, creating pods directly, pods/exec, attach,
 # port-forward, tokens, RBAC objects, update, deletecollection, any other namespace, anything
-# cluster-wide. Each permission here was removed in turn on a real cluster to check it is needed
-# (docs/KUBERNETES_SECURITY.md).
+# cluster-wide. Pod execution and cleanup permissions were removed in turn on a real cluster;
+# event access is covered by the quota-denial tests (docs/KUBERNETES_SECURITY.md).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -31,3 +32,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]

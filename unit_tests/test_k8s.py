@@ -628,12 +628,14 @@ DEPLOY = Path(__file__).resolve().parents[1] / "deploy" / "k8s"
 #   delete ... -l <run> --wait=true       -> list (resolve the selector), delete, watch (wait)
 #   get pods -l <run> -o json             -> pods: list
 #   logs job/<name>                       -> jobs: get, pods: list, pods/log: get
+#   get events (Job FailedCreate, #94)     -> events: get, list
 EXPECTED_RULES = {
     ("", "configmaps"): {"get", "create", "list", "delete", "watch"},
     ("networking.k8s.io", "networkpolicies"): {"get", "create", "list", "delete", "watch"},
     ("batch", "jobs"): {"get", "create", "list", "delete", "watch"},
     ("", "pods"): {"list"},
     ("", "pods/log"): {"get"},
+    ("", "events"): {"get", "list"},
 }
 
 
