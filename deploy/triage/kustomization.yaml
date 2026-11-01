@@ -1,0 +1,15 @@
+# The claimcheck service, checking this repository (kartikeyg0104/triage) instead of nothing.
+# deploy/service ships an empty repo map, so every webhook event is skipped; this overlay maps
+# kartikeyg0104/triage to /repos/triage and clones it there when the pod starts.
+#   kubectl apply -f deploy/service/namespace.yaml
+#   kubectl -n claimcheck-service create secret generic claimcheck-secrets ...   # see deploy/service/README.md
+#   kubectl apply -k deploy/triage
+# The checkout is taken at pod start: `kubectl -n claimcheck-service rollout restart deploy/claimcheck-api`
+# picks up newer commits. See README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../service
+patches:
+  - path: repos.yaml
+  - path: checkout.yaml
