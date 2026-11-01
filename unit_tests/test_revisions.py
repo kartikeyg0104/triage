@@ -98,6 +98,23 @@ def test_runs_base_and_head_in_their_own_worktrees(repo):
         assert not run["dir"].exists()
 
 
+@pytest.mark.parametrize("base,head", [("HEAD", "HEAD"), ("HEAD~1", "HEAD~1"), ("same-base", "same-head")])
+def test_same_commit_is_unverified_and_runs_nothing(repo, base, head):
+    git(repo.path, "branch", "same-base", repo.head)
+    git(repo.path, "branch", "same-head", repo.head)
+    sha = git(repo.path, "rev-parse", base)
+    fake = FakeExecutor()
+    evidence = verify(repo, fake, base=base, head=head)
+    assert evidence.status is U
+    assert "base and head resolve to the same commit" in evidence.detail
+    assert sha in evidence.detail
+    assert "repro not run" in evidence.detail
+    assert evidence.claim.kind == "fix"
+    assert evidence.source == f"base {sha[:12]} → head {sha[:12]}"
+    assert fake.runs == []
+    assert worktrees(repo.path) == [f"worktree {repo.path.resolve()}"]
+
+
 @pytest.mark.parametrize("base,head,expected,headline", [
     (C, R, C, "fix confirmed"),
     (C, C, R, "not fixed"),
@@ -289,6 +306,25 @@ def test_cli_verifies_the_fix_with_the_repro_flag_only(repo, tmp_path, monkeypat
     assert [e["kind"] for e in data["evidence"]] == ["fix"]  # replaces the single repro row
     assert data["evidence"][0]["status"] == "confirmed"
     assert repo.base in data["evidence"][0]["detail"] and repo.head in data["evidence"][0]["detail"]
+
+
+@pytest.mark.parametrize("base,head", [("HEAD", "HEAD"), ("same-base", "same-head")])
+def test_cli_same_commit_is_unverified_and_runs_nothing(repo, tmp_path, monkeypatch, capsys, base, head):
+    git(repo.path, "branch", "same-base", repo.head)
+    git(repo.path, "branch", "same-head", repo.head)
+    fake = FakeExecutor(C, C)
+    monkeypatch.setattr(sandbox, "run_repro", fake)
+    code = cli.main(check(repo, tmp_path, "--repro", "python3 poc.py", "--expect", "buffer overflow",
+                          "--base", base, "--head", head, "--json"))
+    data = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert data["verdict"] == "unverified"
+    assert len(data["evidence"]) == 1
+    evidence = data["evidence"][0]
+    assert evidence["kind"] == "fix" and evidence["status"] == "unverified"
+    assert "base and head resolve to the same commit" in evidence["detail"]
+    assert repo.head in evidence["detail"]
+    assert fake.runs == []
 
 
 def test_cli_without_base_and_head_still_runs_a_single_repro(repo, tmp_path, monkeypatch, capsys):
