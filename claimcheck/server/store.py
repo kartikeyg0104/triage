@@ -43,6 +43,12 @@ COLUMNS = INSERT_COLUMNS + ", error, worker, " \
     "(SELECT outcome FROM writebacks WHERE investigation_id = investigations.id), " \
     "(SELECT error FROM writebacks WHERE investigation_id = investigations.id)"
 TARGET = "replace(lower(investigations.source), 'github:pull_request:', 'github:issues:')"
+WEBHOOK_REPO = "lower(json_extract(request, '$.repo'))"
+WEBHOOK_ROWS = "source GLOB 'github:*'"
+
+
+class WebhookLimitExceeded(ValueError):
+    """Refuse a new delivery without storing its payload or consuming a quota slot."""
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,9 @@ class Store:
             conn.execute(WRITEBACK_SCHEMA)
             conn.execute("CREATE INDEX IF NOT EXISTS writebacks_target ON writebacks (target, outcome)")
             conn.execute("CREATE INDEX IF NOT EXISTS investigations_status ON investigations (status, claimed_at)")
+            for column in ("status", "created_at"):
+                conn.execute(f"CREATE INDEX IF NOT EXISTS investigations_webhook_{column} "
+                             f"ON investigations ({WEBHOOK_REPO}, {column}) WHERE {WEBHOOK_ROWS}")
 
     @contextmanager
     def _connect(self):
@@ -102,19 +111,40 @@ class Store:
             conn.execute("COMMIT")
 
     def create(self, source: str, status: str, request: dict, result: dict | None = None,
-               delivery_id: str | None = None) -> tuple[Investigation, bool]:
+               delivery_id: str | None = None, *, max_pending: int | None = None,
+               max_per_minute: int | None = None) -> tuple[Investigation, bool]:
         """Insert a new investigation. With a delivery_id already stored, return that one instead
-        (False = not created), so a redelivered webhook never makes a second row."""
-        row = (uuid.uuid4().hex, datetime.now(timezone.utc).isoformat(timespec="seconds"), source, delivery_id,
-               status, json.dumps(request), json.dumps(result) if result is not None else None)
-        with self._connect() as conn:
-            inserted = conn.execute(f"INSERT INTO investigations ({INSERT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?) "
-                                    "ON CONFLICT(delivery_id) DO NOTHING", row).rowcount
-            if inserted:
-                return _row(row + (None, None, None, None)), True
-            existing = conn.execute(f"SELECT {COLUMNS} FROM investigations WHERE delivery_id = ?",
-                                    (delivery_id,)).fetchone()
-        return _row(existing), False
+        (False = not created), so a redelivered webhook never makes a second row. Optional webhook
+        caps are checked after deduplication, under the same write lock as the insert."""
+        with self._immediate() as conn:
+            if delivery_id is not None:
+                existing = conn.execute(f"SELECT {COLUMNS} FROM investigations WHERE delivery_id = ?",
+                                        (delivery_id,)).fetchone()
+                if existing is not None:
+                    return _row(existing), False
+            now = time.time()
+            if max_pending is not None or max_per_minute is not None:
+                self._check_webhook_limits(conn, request["repo"].lower(), max_pending, max_per_minute, now)
+            row = (uuid.uuid4().hex, datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="microseconds"),
+                   source, delivery_id, status, json.dumps(request), json.dumps(result) if result is not None else None)
+            conn.execute(f"INSERT INTO investigations ({INSERT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)", row)
+        return _row(row + (None, None, None, None)), True
+
+    def _check_webhook_limits(self, conn: sqlite3.Connection, repo: str, max_pending: int | None,
+                              max_per_minute: int | None, now: float) -> None:
+        """Count persisted rows so restarts and concurrent servers cannot reset or overrun caps."""
+        scope = f"{WEBHOOK_ROWS} AND {WEBHOOK_REPO} = ?"
+        if max_pending is not None:
+            pending = conn.execute(f"SELECT count(*) FROM investigations WHERE {scope} "
+                                   "AND status IN ('received', 'processing')", (repo,)).fetchone()[0]
+            if pending >= max_pending:
+                raise WebhookLimitExceeded(f"repository has reached its pending investigation limit ({max_pending})")
+        if max_per_minute is not None:
+            cutoff = datetime.fromtimestamp(now - 60, timezone.utc).isoformat(timespec="microseconds")
+            recent = conn.execute(f"SELECT count(*) FROM investigations WHERE {scope} AND created_at > ?",
+                                  (repo, cutoff)).fetchone()[0]
+            if recent >= max_per_minute:
+                raise WebhookLimitExceeded(f"repository has reached its deliveries per minute limit ({max_per_minute})")
 
     def get(self, investigation_id: str) -> Investigation | None:
         with self._connect() as conn:
