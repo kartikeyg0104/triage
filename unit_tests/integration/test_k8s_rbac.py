@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -119,7 +120,14 @@ def test_service_account_cannot_run_in_default(tmp_path):
 def test_live_role_has_no_wildcards_secrets_or_exec():
     """The same static checks as the unit tests, on the Role the cluster really has (no PyYAML needed)."""
     role = json.loads(kubectl("get", "role", "claimcheck-executor", "-n", NAMESPACE, "-o", "json").stdout)
-    granted = {(g, r): set(rule["verbs"]) for rule in role["rules"] for g in rule["apiGroups"] for r in rule["resources"]}
+    assert role["metadata"]["namespace"] == NAMESPACE
+    granted = {}
+    for rule in role["rules"]:
+        for group in rule["apiGroups"]:
+            for resource in rule["resources"]:
+                granted.setdefault((group, resource), set()).update(rule["verbs"])
+    assert granted.get(("", "events")) == {"get", "list"}
+    assert {group for group, resource in granted if resource == "events"} == {""}
     assert not [key for key, verbs in granted.items() if "*" in key or "*" in verbs]
     assert not set().union(*granted.values()) & {"patch", "update", "deletecollection", "escalate", "bind", "impersonate"}
     assert not {r for _, r in granted} & {"secrets", "pods/exec", "pods/attach", "pods/portforward", "serviceaccounts/token"}
@@ -145,6 +153,16 @@ def test_service_account_can_read_pod_logs():
     assert can_i("get", "pods", subresource="log")
 
 
+@pytest.mark.parametrize("verb", ["get", "list"])
+def test_service_account_can_read_events(verb: str) -> None:
+    assert can_i(verb, "events")
+
+
+@pytest.mark.parametrize("verb", ["watch", "create", "update", "patch", "delete", "deletecollection"])
+def test_service_account_cannot_watch_or_write_events(verb: str) -> None:
+    assert not can_i(verb, "events")
+
+
 @pytest.mark.parametrize("verb", ["get", "list", "watch", "create"])
 def test_service_account_cannot_touch_secrets(verb):
     assert not can_i(verb, "secrets")
@@ -165,6 +183,7 @@ def test_service_account_cannot_exec_or_escalate(verb, resource, subresource):
 @pytest.mark.parametrize("verb, resource", [
     ("create", "pods"), ("create", "jobs.batch"), ("list", "pods"), ("get", "configmaps"),
     ("delete", "jobs.batch"), ("create", "networkpolicies.networking.k8s.io"), ("get", "secrets"),
+    ("get", "events"), ("list", "events"),
 ])
 def test_service_account_cannot_touch_other_namespaces(namespace, verb, resource):
     assert not can_i(verb, resource, namespace=namespace)
@@ -173,9 +192,84 @@ def test_service_account_cannot_touch_other_namespaces(namespace, verb, resource
 @pytest.mark.parametrize("verb, resource", [
     ("list", "namespaces"), ("create", "namespaces"), ("list", "nodes"),
     ("create", "clusterrolebindings.rbac.authorization.k8s.io"), ("list", "pods"),
+    ("get", "events"), ("list", "events"),
 ])
 def test_service_account_has_no_cluster_wide_access(verb, resource):
     assert not can_i(verb, resource, namespace=None)
+
+
+@pytest.fixture
+def quota_namespace() -> Iterator[str]:
+    """Copy the shipped Role into an isolated namespace so no shared run loses quota."""
+    name = f"claimcheck-rbac-quota-{uuid.uuid4().hex[:10]}"
+    namespace = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}}
+    done = kubectl("create", "-f", "-", input=json.dumps(namespace))
+    assert done.returncode == 0, done.stderr
+    try:
+        for filename in ("role.yaml", "rolebinding.yaml"):
+            done = kubectl("create", "--dry-run=client", "-o", "json", "-f", str(DEPLOY / filename))
+            assert done.returncode == 0, done.stderr
+            manifest = json.loads(done.stdout)
+            manifest["metadata"]["namespace"] = name
+            done = kubectl("create", "-f", "-", input=json.dumps(manifest))
+            assert done.returncode == 0, done.stderr
+        quota = {"apiVersion": "v1", "kind": "ResourceQuota",
+                 "metadata": {"name": "no-pods", "namespace": name}, "spec": {"hard": {"count/pods": "0"}}}
+        done = kubectl("create", "-f", "-", input=json.dumps(quota))
+        assert done.returncode == 0, done.stderr
+        end = time.monotonic() + 30
+        while True:
+            done = kubectl("get", "resourcequota", "no-pods", "-n", name, "-o", "json")
+            assert done.returncode == 0, done.stderr
+            if "count/pods" in json.loads(done.stdout).get("status", {}).get("used", {}):
+                break
+            assert time.monotonic() < end, "quota controller did not initialize usage"
+            time.sleep(0.2)
+        yield name
+    finally:
+        done = kubectl("delete", "namespace", name, "--wait=false")
+        assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("probe", [False, True], ids=["repro", "network-probe"])
+def test_service_account_names_quota_denial_before_deadline(quota_namespace: str, tmp_path: Path,
+                                                          probe: bool) -> None:
+    """The Job succeeds at apply; its FailedCreate event must explain the missing pod."""
+    events = []
+
+    def recording(command: list[str], input: str | None = None, **kw) -> subprocess.CompletedProcess:
+        done = subprocess.run(command, input=input, **kw)
+        if command[1:3] == ["get", "events"]:
+            assert command[command.index("--as") + 1] == SERVICE_ACCOUNT
+            events.append(done)
+        return done
+
+    recorder = RecordingRun(run=recording)
+    (tmp_path / "poc.py").write_text("raise RuntimeError('boom')\n")
+    runner = k8s.KubernetesExecutor(namespace=quota_namespace, image=IMAGE, context=CONTEXT,
+                                    impersonate=SERVICE_ACCOUNT, deadline=20, poll_interval=0.2,
+                                    require_network_isolation=probe, run=recorder)
+    start = time.monotonic()
+    evidence = runner.run_repro(tmp_path, "python3 poc.py", "boom", timeout=60)
+    elapsed = time.monotonic() - start
+
+    assert evidence.status is Status.UNVERIFIED, evidence.detail
+    assert "ResourceQuota setup failure" in evidence.detail, evidence.detail
+    assert "no-pods" in evidence.detail and "count/pods" in evidence.detail, evidence.detail
+    assert "did not finish" not in evidence.detail and "NetworkPolicy" not in evidence.detail
+    assert elapsed < 15, f"waited {elapsed:.1f}s for a 20s deadline: {evidence.detail}"
+    assert len(recorder.names) == 1, recorder.names
+    assert events, "the executor did not try to read Job events"
+    for done in events:
+        assert done.returncode == 0, done.stderr
+    messages = [event.get("message", "") for done in events for event in json.loads(done.stdout).get("items", [])]
+    assert any("exceeded quota: no-pods" in message and "count/pods" in message for message in messages), messages
+    if probe:
+        assert "network probe" in evidence.detail and "egress not verified" in evidence.source
+    assert left_behind(kubectl, quota_namespace, recorder.names) == []
+    done = kubectl("get", "pods", "-n", quota_namespace, "-l", f"{k8s.RUN_LABEL}={recorder.names[0]}", "-o", "name")
+    assert done.returncode == 0, done.stderr
+    assert not done.stdout.strip(), done.stdout
 
 
 # --- Pod Security admission (restricted) ------------------------------------------------------

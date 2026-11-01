@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import urllib.error
 from pathlib import Path
 
@@ -529,3 +530,190 @@ def test_workflow_grants_checks_write():
     yaml = pytest.importorskip("yaml")
     wf = yaml.safe_load((ROOT / ".github/workflows/claimcheck.yml").read_text())
     assert wf["permissions"]["checks"] == "write"
+
+
+# --- Issue forms (issue #70) -------------------------------------------------------------------------
+
+def form_body(symbol="parse_url_v2", repro="python3 poc.py", expected="ValueError: bad url"):
+    """An issue body exactly as GitHub renders a submitted claimcheck bug form."""
+    return (
+        f"### Affected function or class\n\n{symbol}\n\n"
+        f"### Repro command\n\n```shell\n{repro}\n```\n\n"
+        f"### Expected error text\n\n{expected or '_No response_'}\n\n"
+        "### Version or commit\n\nv1.2.3\n\n"
+        "### Description\n\nThe parser crashes on a long host.\n"
+    )
+
+
+def run_issue(tmp_path, repo, body, title="Bug report", api=None, **extra):
+    event = tmp_path / "issue_event.json"
+    event.write_text(json.dumps({"action": "opened", "issue": {"number": 7, "title": title, "body": body}}))
+    api = api or FakeApi()
+    code = action.run(env(tmp_path, repo, GITHUB_EVENT_PATH=str(event), **extra), api)
+    posted = [c for c in api.calls if c[0] in ("POST", "PATCH") and "/comments" in c[1]]
+    return code, posted[0][2]["body"], api
+
+
+def suggested_lines(comment):
+    return [line for line in comment.splitlines() if "suggested repro (not run)" in line.lower()]
+
+
+def code_span_content(line):
+    """The content of the single code span on line, checking it is fenced by a long enough backtick run."""
+    match = re.search(r"(?<!`)(`+) (.*) \1(?!`)", line)
+    assert match, f"no code span in {line!r}"
+    fence, content = match.groups()
+    assert fence not in content, "a backtick run in the value could close the code span early"
+    return content
+
+
+def test_form_symbol_is_added_to_the_claims(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _, comment, _ = run_issue(tmp_path, repo, form_body(symbol="parse_url"), title="Parser crash")
+    assert "✓ confirmed | parse_url() exists" in comment
+
+
+def test_form_symbol_is_deduplicated_with_text_claims(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _, comment, _ = run_issue(tmp_path, repo, form_body(symbol="parse_url"), title="parse_url() crashes")
+    assert comment.count("parse_url() exists") == 1
+
+
+def test_form_symbol_written_as_a_call_or_code_is_accepted(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _, comment, _ = run_issue(tmp_path, repo, form_body(symbol="`parse_url_v2()`"), title="Crash")
+    assert "parse_url_v2() exists" in comment
+
+
+@pytest.mark.parametrize("symbol", ["parse_url`; touch pwned`", "$(touch pwned)", "<script>alert(1)</script>",
+                                    "two words", "9lives", "Session.close"])
+def test_form_symbol_that_is_not_an_identifier_is_dropped(tmp_path, symbol):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _, comment, _ = run_issue(tmp_path, repo, form_body(symbol=symbol), title="Crash")
+    table = [line for line in comment.splitlines() if line.startswith("| ")]
+    assert not [line for line in table if symbol in line or "pwned" in line or "script" in line]
+    assert "no checkable claims found" in comment
+    assert not (repo / "pwned").exists()
+
+
+def test_form_repro_is_shown_as_a_suggestion(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _, comment, _ = run_issue(tmp_path, repo, form_body(), title="Crash")
+    lines = suggested_lines(comment)
+    assert len(lines) == 1
+    assert code_span_content(lines[0]) == "python3 poc.py"
+    expected = [line for line in comment.splitlines() if "expected error" in line.lower()]
+    assert len(expected) == 1 and code_span_content(expected[0]) == "ValueError: bad url"
+    assert "suggested repro (not run)" in (tmp_path / "summary.md").read_text().lower()
+
+
+def test_form_without_expected_error_shows_only_the_repro(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _, comment, _ = run_issue(tmp_path, repo, form_body(expected=""), title="Crash")
+    assert len(suggested_lines(comment)) == 1
+    assert "expected error" not in comment.lower()
+    assert "No response" not in comment
+
+
+def test_form_repro_is_never_run(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "MARKER_FILE"
+    seen = []
+    real = action.run_check
+
+    def spy(root, text, diff, repro, expect, **kw):
+        seen.append((repro, expect))
+        return real(root, text, diff, repro, expect, **kw)
+
+    monkeypatch.setattr(action, "run_check", spy)
+    _, comment, _ = run_issue(tmp_path, repo, form_body(repro=f"touch {marker}", expected="boom"), title="Crash")
+    assert seen == [(None, "")]
+    assert not marker.exists() and not (repo / "MARKER_FILE").exists()
+    assert "reproduces the reported failure" not in comment
+    assert code_span_content(suggested_lines(comment)[0]) == f"touch {marker}"
+
+
+def test_only_the_workflow_repro_input_is_passed_on(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    seen = []
+
+    def fake(root, text, diff, repro, expect, **kw):
+        seen.append((repro, expect))
+        return Verdict(), None
+
+    monkeypatch.setattr(action, "run_check", fake)
+    run_issue(tmp_path, repo, form_body(repro="touch FORM_MARKER", expected="from form"), title="Crash",
+              INPUT_REPRO="python3 -c 'raise SystemExit(1)'", INPUT_EXPECT="from workflow")
+    assert seen == [("python3 -c 'raise SystemExit(1)'", "from workflow")]
+
+
+MALICIOUS = ("python3 poc.py `touch pwned1` ``x`` $(touch pwned2)\n<script>alert(1)</script>\n# Heading\n\n"
+             "[x](javascript:alert(1))")
+
+
+def test_malicious_form_values_stay_inert_in_the_comment(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(tmp_path)
+    body = form_body(repro=MALICIOUS, expected="`oops` $(touch pwned3)\n<script>x</script>")
+    _, comment, _ = run_issue(tmp_path, repo, body, title="Crash")
+    lines = comment.splitlines()
+    for bad in ("<script", "# Heading", "[x](", "`oops`"):
+        assert not [line for line in lines if line.lstrip().startswith(bad)], bad
+    repro = code_span_content(suggested_lines(comment)[0])
+    assert "`touch pwned1`" in repro and "$(touch pwned2)" in repro and "<script>alert(1)</script>" in repro
+    expected = [line for line in lines if "expected error" in line.lower()]
+    assert len(expected) == 1 and "<script>x</script>" in code_span_content(expected[0])
+    for name in ("pwned1", "pwned2", "pwned3"):
+        assert not (tmp_path / name).exists() and not (repo / name).exists()
+
+
+def test_malicious_form_values_cannot_issue_workflow_commands(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_issue(tmp_path, repo, form_body(repro="x\n::warning file=a::owned"), title="Crash")
+    out = capsys.readouterr().out
+    assert not [line for line in out.splitlines() if line.startswith("::warning")]
+    stop = [line for line in out.splitlines() if line.startswith("::stop-commands::")]
+    assert stop and out.index(stop[0]) < out.index("owned")
+
+
+def test_free_text_issue_is_unchanged(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    body = "parse_url() crashes when I run `python3 poc.py`\n\n### Steps\n\nrun it"
+    _, comment, _ = run_issue(tmp_path, repo, body, title="Crash")
+    verdict, model = action.run_check(repo, f"Crash\n\n{body}", None, None, "", use_model=False)
+    assert comment == action.MARKER + "\n" + action.report.to_markdown(verdict, model)
+    assert "suggested repro" not in comment.lower()
+
+
+def test_pr_body_shaped_like_a_form_is_not_treated_as_one(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    event = make_event(tmp_path, body=form_body(symbol="parse_url"), name="pr_form.json")
+    api = FakeApi()
+    action.run(env(tmp_path, repo, GITHUB_EVENT_PATH=str(event)), api)
+    comment = [c for c in api.calls if c[0] == "POST" and "/comments" in c[1]][0][2]["body"]
+    assert "suggested repro" not in comment.lower()
+    assert "parse_url() exists" not in comment
+
+
+def test_workflow_runs_on_issues_without_a_repro():
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load((ROOT / ".github/workflows/claimcheck.yml").read_text())
+    triggers = wf.get("on") or wf.get(True)  # PyYAML reads a bare `on:` key as True
+    assert sorted(triggers["issues"]["types"]) == ["edited", "opened"]
+    assert "pull_request" in triggers
+    assert wf["permissions"]["issues"] == "write"
+    ours = [s for s in wf["jobs"]["claims"]["steps"] if s.get("uses") == "./"][0]
+    assert not (ours.get("with") or {}).get("repro")
