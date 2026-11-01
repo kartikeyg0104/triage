@@ -121,6 +121,107 @@ def test_plain_word_is_marked_only_by_its_own_call_or_backticks():
     assert [c.target for c in kept.claims] == ["app"]
 
 
+@pytest.mark.parametrize("message", [
+    '"ValueError: max() iterable argument is empty"',
+    "'ValueError: max() iterable argument is empty'",
+    "`ValueError: max() iterable argument is empty`",
+    '"ValueError: `max()` failed in `ErrorHandler`"',
+    '"ValueError: max() received \\"empty\\" input"',
+    "```text\nValueError: max() iterable argument is empty\n```",
+    "~~~text\nValueError: max() iterable argument is empty\n~~~",
+    '"max() could not select a candidate"',
+])
+@pytest.mark.parametrize("mode", ["regex", "model", "model_miss", "fallback"])
+def test_names_inside_quoted_errors_are_not_claims(message, mode):
+    report = f"best_match() fails with {message}. Also see `Router`."
+    if mode == "regex":
+        result = extract.regex_extract(report)
+    else:
+        reply = {"symbols": ["best_match", "Router", "max", "ValueError", "ErrorHandler"]}
+        generate = fake(reply if mode == "model" else {"symbols": []})
+        if mode == "fallback":
+            generate = lambda prompt: "not json"
+        result = extract.extract_claims(report, generate)
+    assert {c.target for c in result.claims} == {"best_match", "Router"}
+
+
+@pytest.mark.parametrize("outside", ["max() also fails.", "`max()` also fails."])
+def test_a_name_in_an_error_is_kept_when_claimed_elsewhere(outside):
+    report = f'{outside} best_match() fails with "ValueError: max() iterable argument is empty".'
+    assert {c.target for c in extract.regex_extract(report).claims} == {"max", "best_match"}
+    result = extract.extract_claims(report, fake({"symbols": ["max", "best_match"]}))
+    assert {c.target for c in result.claims} == {"max", "best_match"}
+
+
+@pytest.mark.parametrize("message", [
+    '"ValueError: max() iterable argument is empty"',
+    "`ValueError: max() iterable argument is empty`",
+    "``ValueError: `max()` failed``",
+    "```text\nValueError: max() iterable argument is empty\n```",
+])
+def test_error_diagnostics_are_excluded_without_an_introductory_phrase(message):
+    report = f"best_match() crashed. Observed output: {message}."
+    assert [c.target for c in extract.regex_extract(report).claims] == ["best_match"]
+    result = extract.extract_claims(report, fake({"symbols": ["best_match", "max", "ValueError"]}))
+    assert [c.target for c in result.claims] == ["best_match"]
+
+
+def test_ordinary_quoted_symbols_and_source_code_remain_claims():
+    report = ('The report names "parse_url()" and `Router`.\n'
+              '```python\nparse_header()\n```\n'
+              '```text\nload_config()\nValueError: max() failed\n```\n'
+              'Also finish_report().')
+    assert {c.target for c in extract.regex_extract(report).claims} == {
+        "parse_url", "Router", "parse_header", "load_config", "finish_report"}
+
+
+@pytest.mark.parametrize("message", [
+    "max() iterable argument is empty",
+    "select_item() failed in ErrorHandler",
+])
+def test_validated_model_expected_error_is_excluded_from_both_symbol_passes(message):
+    report = f"best_match() fails and prints {message}. Run `python poc.py`."
+    result = extract.extract_claims(report, fake({
+        "symbols": ["best_match", "max", "select_item", "ErrorHandler"],
+        "expected_error": message, "repro_command": "python poc.py"}))
+    assert [c.target for c in result.claims] == ["best_match"]
+    assert result.expected_error == message
+    assert result.repro_command == "python poc.py"
+
+
+def test_expected_error_filter_preserves_other_occurrences_of_the_same_name():
+    message = "select_item() failed in ErrorHandler"
+    report = f"select_item() calls ErrorHandler. best_match() prints {message}."
+    result = extract.extract_claims(report, fake({
+        "symbols": ["select_item", "ErrorHandler", "best_match"], "expected_error": message}))
+    assert {c.target for c in result.claims} == {"select_item", "ErrorHandler", "best_match"}
+
+
+def test_invented_expected_error_cannot_hide_a_symbol():
+    result = extract.extract_claims("best_match() calls max().", fake({
+        "symbols": ["best_match", "max"], "expected_error": "max() fails"}))
+    assert {c.target for c in result.claims} == {"best_match", "max"}
+    assert result.expected_error == ""
+
+
+@pytest.mark.parametrize("message", [
+    "max() iterable argument is empty",
+    "```text\nselect_item() failed\n### ErrorHandler\n```",
+])
+def test_issue_form_expected_error_section_is_not_a_symbol_claim(message):
+    report = (f"### Affected function or class\n\nbest_match()\n\n"
+              f"### Expected error text\n\n{message}\n\n"
+              "### Description\n\n`Router` calls select_item().")
+    assert {c.target for c in extract.regex_extract(report).claims} == {"best_match", "Router", "select_item"}
+    result = extract.extract_claims(report, fake({"symbols": ["best_match", "max", "Router", "select_item", "ErrorHandler"]}))
+    assert {c.target for c in result.claims} == {"best_match", "Router", "select_item"}
+
+
+def test_inline_expected_error_text_is_not_a_symbol_claim():
+    report = "best_match() crashes.\nExpected error text: select_item() failed in ErrorHandler\n`Router` breaks too."
+    assert {c.target for c in extract.regex_extract(report).claims} == {"best_match", "Router"}
+
+
 # Issue #50: the report is untrusted text that goes to the model.
 
 def capture(payload):
