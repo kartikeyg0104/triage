@@ -20,3 +20,4 @@ claimcheck = "claimcheck.cli:main"
 
 [tool.setuptools]
 packages = ["claimcheck", "claimcheck.server"]
+

@@ -161,3 +161,16 @@ def test_csp_allows_the_get_search_form_and_still_no_script(client):
     directives = {part.split()[0]: part.split()[1:] for part in csp.split(";") if part.strip()}
     assert directives["form-action"] == ["'self'"]
     assert "script-src" not in directives and directives["default-src"] == ["'none'"]
+
+
+def test_unknown_status_and_hostile_verdict_get_plain_markup(client, store):
+    odd = store.create("api", f"weird{SCRIPT}", {}, {"verdict": f"maybe{SCRIPT}", "evidence": []})[0]
+    listing = client.get("/dashboard").text
+    assert '<span class="pill">weird&lt;script&gt;' in listing  # unknown values never reach a class name
+    detail = client.get(f"/dashboard/investigations/{odd.id}").text
+    assert '<div class="banner"><strong>maybe&lt;script&gt;' in detail and "<script" not in detail
+
+
+def test_empty_list_shows_how_to_start(client):
+    page = client.get("/dashboard").text
+    assert "No investigations" in page and "/v1/github/webhook" in page
