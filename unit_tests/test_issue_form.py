@@ -39,6 +39,60 @@ def test_crlf_line_endings():
     assert parse_issue_form(RENDERED.replace("\n", "\r\n")) == parse_issue_form(RENDERED)
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_comments_are_removed_from_realistic_rendered_body(newline: str):
+    body = (
+        "### Affected function or class\n\n"
+        "<!-- Name the affected symbol. -->parse_header<!-- No parentheses. -->\n\n"
+        "### Repro command\n\n"
+        "<!-- Replace this command with your reproduction. -->\n"
+        "```shell\n"
+        "<!-- One command only. -->\n"
+        "python -c \"from pkg import parse_header; parse_header('x')\"\n"
+        "```\n"
+        "<!-- Do not include credentials. -->\n\n"
+        "### Expected error text\n\n"
+        "<!-- Paste the error here. -->ValueError: bad header\n\n"
+        "### Version or commit\n\n"
+        "v1.2.3 (abc1234)<!-- Use the tested revision. -->\n\n"
+        "### Description\n\n"
+        "Calling parse_header with one byte crashes.\n"
+        "<!-- Template instructions:\n"
+        "### Version or commit\n\n"
+        "v1.2.3 or abc1234\n"
+        "```shell\n"
+        "-->It happens every time.\n"
+    )
+    assert parse_issue_form(body.replace("\n", newline)) == parse_issue_form(RENDERED)
+
+
+@pytest.mark.parametrize("field_id", list(FIELDS))
+def test_comment_only_rendered_field_is_empty(field_id: str):
+    value = "<!-- Replace this placeholder\nwith your report. -->\n<!-- More guidance. -->"
+    if field_id == "repro_command":
+        value = f"```shell\n{value}\n```"
+    body = f"### {FIELDS[field_id]}\n\n{value}\n"
+    form = parse_issue_form(body)
+    assert form == IssueForm()
+    assert form.is_empty()
+
+
+def test_comments_around_no_response_placeholders_are_empty():
+    body = (
+        "### Repro command\n\n"
+        "<!-- Enter a command. -->\n```shell\n_No response_\n```\n\n"
+        "### Expected error text\n\n"
+        "<!-- Paste the error here. -->\n_No response_\n<!-- Optional. -->\n\n"
+        "### Version or commit\n\n2.0\n"
+    )
+    assert parse_issue_form(body) == IssueForm(version="2.0")
+
+
+def test_unclosed_comment_does_not_leak_template_text():
+    body = "### Description\n\nObserved a crash.\n<!-- Template instructions\n### Version or commit\nexample"
+    assert parse_issue_form(body) == IssueForm(description="Observed a crash.")
+
+
 def test_no_response_means_empty():
     body = (
         "### Affected function or class\n\nfoo\n\n"
