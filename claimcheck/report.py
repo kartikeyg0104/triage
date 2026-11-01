@@ -5,7 +5,7 @@ import re
 
 from . import __version__
 from .extract import MAX_REPORT_CHARS
-from .models import Status, Verdict
+from .models import Claim, Evidence, Status, Verdict
 
 ICON = {Status.CONFIRMED: "✓", Status.REFUTED: "✗", Status.UNVERIFIED: "!"}
 EXIT_CODE = {"supported": 0, "refuted": 1, "unverified": 2}
@@ -39,6 +39,50 @@ def to_json(verdict: Verdict, model: str | None) -> str:
             for e in verdict.evidence
         ],
     }, indent=2) + "\n"
+
+
+def _unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Duplicate JSON keys would make the saved evidence ambiguous."""
+    fields = {}
+    for key, value in pairs:
+        if key in fields:
+            raise ValueError(f"duplicate report field: {key}")
+        fields[key] = value
+    return fields
+
+
+def _report_fields(value: object, expected: set[str], name: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"unknown report schema: {name} must contain {', '.join(sorted(expected))}")
+    return value
+
+
+def from_json(text: str) -> tuple[Verdict, str | None]:
+    """Validate the saved report shape before restoring evidence; never infer missing values."""
+    data = _report_fields(json.loads(text, object_pairs_hook=_unique_fields),
+                          {"verdict", "extraction_model", "revision", "report_truncated", "evidence"}, "report")
+    if not isinstance(data["verdict"], str) or data["verdict"] not in EXIT_CODE:
+        raise ValueError("invalid report verdict")
+    for key in ("extraction_model", "revision"):
+        if data[key] is not None and not isinstance(data[key], str):
+            raise ValueError(f"invalid report {key}: expected a string or null")
+    if not isinstance(data["report_truncated"], bool):
+        raise ValueError("invalid report report_truncated: expected a boolean")
+    if not isinstance(data["evidence"], list):
+        raise ValueError("invalid report evidence: expected a list")
+    evidence = []
+    for value in data["evidence"]:
+        row = _report_fields(value, {"kind", "claim", "status", "basis", "detail", "source"}, "evidence row")
+        if not all(isinstance(field, str) for field in row.values()):
+            raise ValueError("invalid report evidence: every field must be a string")
+        if row["basis"] not in {"observed", "inferred"}:
+            raise ValueError("invalid report evidence basis")
+        evidence.append(Evidence(Claim(row["kind"], row["claim"]), Status(row["status"]),
+                                 row["detail"], row["source"], row["basis"]))
+    verdict = Verdict(evidence, revision=data["revision"] or "", report_truncated=data["report_truncated"])
+    if verdict.outcome != data["verdict"]:
+        raise ValueError("report verdict does not match its evidence")
+    return verdict, data["extraction_model"]
 
 
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
