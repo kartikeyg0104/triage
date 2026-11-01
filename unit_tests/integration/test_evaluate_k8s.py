@@ -36,7 +36,7 @@ def test_ground_truth_cases_through_kubernetes(tmp_path):
     cases = evaluate.load_cases(ROOT / "eval" / "cases")
     assert metrics["cases"] == metrics["scored"] == len(cases)
     assert metrics["skipped"] == metrics["wrong_confirmed"] == metrics["wrong_refuted"] == 0
-    assert metrics["claims_correct"] == metrics["claims_total"]
+    assert metrics["claims_correct"] == metrics["claims_total"], markdown
     assert metrics["verdicts_correct"] == metrics["repeatable"] == len(cases)
     assert set(metrics) == set(local["metrics"])
     if not local["metrics"]["skipped"]:
